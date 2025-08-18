@@ -1,0 +1,1 @@
+{"root":["./src/index.ts","./src/commands/aws/check.ts","./src/commands/aws/sagemaker-bootstrap.ts","./src/commands/logs/latest.ts","./src/commands/logs/query.ts","./src/commands/logs/search.ts","./src/commands/logs/tail.ts","./src/commands/tidb/dsn.ts","./src/commands/tidb/oauth.ts","./src/lib/config.ts"],"version":"5.9.2"}
