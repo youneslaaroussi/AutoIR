@@ -21,6 +21,14 @@ export type AppConfig = {
     bedrockRegion?: string
     bedrockModel?: string
   }
+  llm?: {
+    provider?: 'aws' | 'openai'
+    // For AWS/Kimi K2 backend, we reuse saved endpoints file; keep current selected name here
+    currentEndpoint?: string
+    // For OpenAI backend
+    openaiApiKey?: string
+    openaiModel?: string
+  }
 }
 
 const CONFIG_DIR = path.join(os.homedir(), '.autoir')
@@ -82,6 +90,21 @@ export async function getEmbedConfig(): Promise<Required<NonNullable<AppConfig['
 export async function setEmbedConfig(embed: NonNullable<AppConfig['embed']>): Promise<void> {
   const cfg = await readConfig()
   cfg.embed = embed
+  await writeConfig(cfg)
+}
+
+
+export type LlmConfig = Required<NonNullable<AppConfig['llm']>>
+
+export async function getLlmConfig(): Promise<NonNullable<AppConfig['llm']> | undefined> {
+  const cfg = await readConfig()
+  if (!cfg.llm || !cfg.llm.provider) return undefined
+  return cfg.llm
+}
+
+export async function setLlmConfig(llm: NonNullable<AppConfig['llm']>): Promise<void> {
+  const cfg = await readConfig()
+  cfg.llm = llm
   await writeConfig(cfg)
 }
 

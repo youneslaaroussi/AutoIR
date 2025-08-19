@@ -1,9 +1,12 @@
 import {Command, Flags} from '@oclif/core'
 import mysql from 'mysql2/promise'
 import {SageMakerRuntimeClient, InvokeEndpointCommand} from '@aws-sdk/client-sagemaker-runtime'
+import {spawn} from 'node:child_process'
 import {getTiDBProfile, parseMySqlDsn} from '../../lib/config.js'
 import blessed from 'blessed'
 import inquirer from 'inquirer'
+import {ToolManager} from '../../lib/tools/index.js'
+import {LlmClient, LlmMessage} from '../../lib/llm/client.js'
 
 type SearchResult = {
   id: string
@@ -86,7 +89,7 @@ export default class LogsSearch extends Command {
       label: ' Search Query ',
       top: 4,
       left: 2,
-      width: '50%',
+      width: '60%',
       height: 3,
       border: {
         type: 'line'
@@ -111,8 +114,8 @@ export default class LogsSearch extends Command {
       parent: container,
       label: ' Status ',
       top: 4,
-      left: '52%',
-      width: '46%',
+      left: '62%',
+      width: '36%',
       height: 3,
       border: {
         type: 'line'
@@ -133,8 +136,8 @@ export default class LogsSearch extends Command {
       label: ' Search Results ',
       top: 8,
       left: 2,
-      width: '96%',
-      height: '70%',
+      width: '60%',
+      height: '60%',
       border: {
         type: 'line'
       },
@@ -159,10 +162,10 @@ export default class LogsSearch extends Command {
     const detailBox = blessed.box({
       parent: container,
       label: ' Message Detail ',
-      top: '80%',
+      top: '70%',
       left: 2,
-      width: '96%',
-      height: '18%',
+      width: '60%',
+      height: '28%',
       border: {
         type: 'line'
       },
@@ -177,13 +180,73 @@ export default class LogsSearch extends Command {
       content: 'Select a result to view details...'
     })
 
+    // Tail logs panel (right-bottom)
+    const tailLogsBox = blessed.box({
+      parent: container,
+      label: ' Ingestion Logs ',
+      top: '70%',
+      left: '62%',
+      width: '36%',
+      height: '28%',
+      border: {type: 'line'},
+      style: {fg: 'white', bg: 'black', border: {fg: 'blue'}},
+      scrollable: true,
+      alwaysScroll: true,
+      keys: true,
+      vi: true,
+      tags: false,
+      content: 'No background tail running yet.'
+    })
+
+    // Chat panel (container)
+    const chatPanel = blessed.box({
+      parent: container,
+      label: ' LLM Chat ',
+      top: 8,
+      left: '62%',
+      width: '36%',
+      height: '60%',
+      border: {type: 'line'},
+      style: {fg: 'white', bg: 'black', border: {fg: 'magenta'}},
+      tags: true
+    })
+
+    // Chat transcript inside panel
+    const chatTranscript = blessed.box({
+      parent: chatPanel,
+      top: 1,
+      left: 1,
+      width: '100%-2',
+      height: '100%-5',
+      style: {fg: 'white', bg: 'black'},
+      scrollable: true,
+      alwaysScroll: true,
+      keys: true,
+      vi: true,
+      tags: true,
+      content: '{gray-fg}Press c to focus chat. Type a question and Enter.{/gray-fg}'
+    })
+
+    // Chat input inside panel
+    const chatInput = blessed.textbox({
+      parent: chatPanel,
+      label: ' Chat ',
+      top: '100%-5',
+      left: 1,
+      width: '100%-3',
+      height: 3,
+      border: {type: 'line'},
+      style: {fg: 'white', bg: 'black', border: {fg: 'magenta'}, focus: {border: {fg: 'yellow'}}},
+      inputOnFocus: true
+    })
+
     // Instructions
     const instructions = blessed.text({
       parent: container,
       bottom: 0,
       height: 1,
       width: '100%',
-      content: '{center}TAB to navigate • s or / to search • Enter to search • q to quit • ↑↓ to browse results{/center}',
+      content: '{center}TAB to navigate • s or / to search • c to chat • t to focus tail • Enter to submit • a to ask about selected result • q to quit{/center}',
       tags: true,
       style: {
         fg: 'yellow',
@@ -236,6 +299,92 @@ export default class LogsSearch extends Command {
       screen.render()
     }
 
+    // LLM chat setup
+    const tools = new ToolManager()
+    const llm = new LlmClient(tools)
+    await llm.ensureConfigured()
+    const conversation: LlmMessage[] = [
+      {role: 'system', content: llm.buildSystemPrompt()}
+    ]
+
+    const appendChat = (prefix: string, text: string) => {
+      const old = chatTranscript.getContent() || ''
+      const next = `${old}${old ? '\n' : ''}${prefix}${text}`
+      chatTranscript.setContent(next)
+      chatTranscript.setScrollPerc(100)
+    }
+
+    const sendChat = async (input: string) => {
+      if (!input.trim()) return
+      appendChat('{cyan-fg}You:{/cyan-fg} ', input)
+      conversation.push({role: 'user', content: input})
+      // Intercept analysis tool calls for approval
+      const originalExecute = (tools as any).executeTool.bind(tools)
+      ;(tools as any).executeTool = async (toolCall: any) => {
+        if (toolCall.name === 'analysis') {
+          const {approve} = await inquirer.prompt([{type: 'confirm', name: 'approve', default: false, message: `Unsafe analysis tool call with args ${JSON.stringify(toolCall.arguments)}. Approve?`}])
+          if (!approve) return 'User rejected analysis tool call.'
+        }
+        return originalExecute(toolCall)
+      }
+      const {final} = await llm.handleToolCycle(conversation, {temperature: 0.6, maxTokens: 500})
+      appendChat('{green-fg}Assistant:{/green-fg} ', final)
+      screen.render()
+    }
+
+    // Background tail setup
+    const sanitizeAnsi = (s: string) => s.replace(/\u001b\[[0-9;]*m/g, '')
+    let tailChild: ReturnType<typeof spawn> | null = null
+    let tailBuffer: string[] = []
+    const appendTail = (line: string) => {
+      const clean = sanitizeAnsi(line).trimEnd()
+      if (!clean) return
+      tailBuffer.push(clean)
+      if (tailBuffer.length > 400) tailBuffer.splice(0, tailBuffer.length - 400)
+      tailLogsBox.setContent(tailBuffer.join('\n'))
+      tailLogsBox.setScrollPerc(100)
+      screen.render()
+    }
+
+    const startTail = async () => {
+      const ans = await inquirer.prompt<{group?: string}>([{
+        type: 'input',
+        name: 'group',
+        message: 'CloudWatch log group to tail in background (leave blank to skip):',
+        default: ''
+      }])
+      const group = (ans.group || '').trim()
+      if (!group) {
+        appendTail('Skipping background tail. Press t to focus here later.')
+        return
+      }
+      const args = ['logs', 'tail', group]
+      // propagate flags
+      if (flags.region) args.unshift('--region', flags.region)
+      args.push('--follow')
+      args.push('--format', 'detailed')
+      // Run via AWS CLI directly, but we want embedding and storage—use our tail command instead
+      const cmd = process.execPath
+      const runArgs = ['./bin/run.js', 'logs', 'tail', group,
+        ...(flags['sagemaker-endpoint'] ? ['--sagemaker-endpoint', flags['sagemaker-endpoint']] : []),
+        ...(flags['sagemaker-region'] ? ['--sagemaker-region', flags['sagemaker-region']] : []),
+        ...(flags.region ? ['--region', flags.region] : []),
+      ]
+      appendTail(`Starting tail: node ${runArgs.join(' ')}`)
+      tailChild = spawn(cmd, runArgs)
+      tailChild.stdout?.on('data', (d) => {
+        const str = d.toString()
+        for (const line of str.split('\n')) appendTail(line)
+      })
+      tailChild.stderr?.on('data', (d) => {
+        const str = d.toString()
+        for (const line of str.split('\n')) appendTail(line)
+      })
+      tailChild.on('close', (code) => {
+        appendTail(`Tail process exited with code ${code}`)
+      })
+    }
+
     // Event handlers
     searchBox.on('submit', async (query) => {
       await performSearch(query)
@@ -258,10 +407,18 @@ ${result.message}`
       }
     })
 
+    chatInput.on('submit', async (q) => {
+      await sendChat(q)
+      chatInput.clearValue()
+      chatInput.focus()
+    })
+
     // Navigation
     screen.key(['tab'], () => {
       if (screen.focused === searchBox) {
         resultsList.focus()
+      } else if (screen.focused === resultsList) {
+        chatInput.focus()
       } else {
         searchBox.focus()
       }
@@ -269,6 +426,27 @@ ${result.message}`
 
     screen.key(['s', '/'], () => {
       searchBox.focus()
+    })
+
+    screen.key(['c'], () => {
+      chatInput.focus()
+    })
+
+    screen.key(['t'], () => {
+      tailLogsBox.focus()
+    })
+
+    // Ask about selected result
+    screen.key(['a'], () => {
+      const results = (resultsList as any).searchResults
+      const idx = (resultsList as any).selected || 0
+      if (results && results[idx]) {
+        const r = results[idx]
+        const text = `Please analyze this log entry and potential root cause. Score=${(1 - r.distance).toFixed(3)}, ts=${new Date(r.ts_ms).toISOString()}, group=${r.log_group}, stream=${r.log_stream}. Message: ${r.message}`
+        chatInput.setValue(text)
+        chatInput.focus()
+        screen.render()
+      }
     })
 
     screen.key(['q', 'C-c'], () => {
@@ -279,6 +457,8 @@ ${result.message}`
     // Initial focus and render
     searchBox.focus()
     screen.render()
+    // Start background tail prompt on startup
+    startTail().catch(() => {})
   }
 
   private async resolveTiDBConn(flags: any): Promise<{host: string; port?: number; user: string; password?: string; database: string}> {
