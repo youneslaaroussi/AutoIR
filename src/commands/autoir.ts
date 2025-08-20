@@ -1,12 +1,12 @@
 import {Command, Flags} from '@oclif/core'
 import mysql from 'mysql2/promise'
 import {StartupScreen, StartupProcess} from '../lib/startup.js'
-import {getTiDBProfile, parseMySqlDsn} from '../lib/config.js'
-import LogsSearch from './logs/search.js'
+import {getTiDBProfile, parseMySqlDsn, readConfig, writeConfig} from '../lib/config.js'
 import blessed from 'blessed'
 import contrib from 'blessed-contrib'
-import {execFile} from 'node:child_process'
+import {execFile, spawn} from 'node:child_process'
 import {promisify} from 'node:util'
+import {SageMakerRuntimeClient, InvokeEndpointCommand} from '@aws-sdk/client-sagemaker-runtime'
 
 const execFileAsync = promisify(execFile)
 
@@ -57,9 +57,10 @@ export default class AutoIR extends Command {
     'tidb-database': Flags.string({description: 'TiDB database'}),
     dsn: Flags.string({description: 'MySQL DSN: mysql://user:pass@host:port/db', env: 'TIDB_DSN'}),
     'no-animation': Flags.boolean({description: 'Disable startup animation', default: false}),
-    dashboard: Flags.boolean({description: 'Show Fargate status dashboard', default: false}),
+    dashboard: Flags.boolean({description: 'Show combined dashboard (Fargate + search)', default: true}),
     cluster: Flags.string({description: 'ECS cluster name for dashboard', default: 'autoir'}),
     service: Flags.string({description: 'ECS service name for dashboard', default: 'autoir'}),
+    'auto-bootstrap': Flags.boolean({description: 'Automatically bootstrap missing prerequisites (SageMaker endpoint)', default: true}),
   }
 
   private state: AppState = AppState.INITIALIZING
@@ -96,6 +97,8 @@ export default class AutoIR extends Command {
   }
 
   private async runInitialization(flags: any): Promise<void> {
+    const cfg = await readConfig()
+
     const processes: StartupProcess[] = [
       {
         name: 'tidb_connection',
@@ -119,13 +122,10 @@ export default class AutoIR extends Command {
           
           return {host: conn.host, database: conn.database}
         }
-      }
-    ]
-
-    if (flags.dashboard) {
-      processes.push({
-        name: 'aws_connection',
-        description: 'Testing AWS connectivity for Fargate dashboard',
+      },
+      {
+        name: 'aws_check',
+        description: 'Checking AWS CLI and authentication',
         run: async () => {
           const args = ['sts', 'get-caller-identity', '--output', 'json']
           if (flags.region) args.unshift('--region', flags.region)
@@ -133,8 +133,34 @@ export default class AutoIR extends Command {
           const identity = JSON.parse(stdout)
           return {account: identity.Account, userId: identity.UserId}
         }
-      })
-    }
+      },
+      {
+        name: 'sagemaker_endpoint',
+        description: 'Validating SageMaker embedding endpoint',
+        run: async () => {
+          const region = flags['sagemaker-region'] || flags.region || process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION
+          const endpoint = flags['sagemaker-endpoint']
+          if (!region || !endpoint) throw new Error('Missing --sagemaker-endpoint or region')
+          try {
+            const {stdout} = await execFileAsync('aws', ['sagemaker', 'describe-endpoint', '--endpoint-name', endpoint, '--region', region, '--output', 'json'])
+            const data = JSON.parse(stdout)
+            const status = data?.EndpointStatus
+            if (status !== 'InService' && flags['auto-bootstrap']) {
+              // Attempt bootstrap via our own CLI command for consistency
+              await execFileAsync(process.execPath, ['./bin/run.js', 'aws', 'sagemaker-bootstrap', '--region', region, '--endpoint', endpoint])
+              return {endpoint, status: 'Bootstrapped'}
+            }
+            return {endpoint, status}
+          } catch (e) {
+            if (flags['auto-bootstrap'] && region && endpoint) {
+              await execFileAsync(process.execPath, ['./bin/run.js', 'aws', 'sagemaker-bootstrap', '--region', region, '--endpoint', endpoint])
+              return {endpoint, status: 'Bootstrapped'}
+            }
+            throw e
+          }
+        }
+      },
+    ]
 
     const startup = new StartupScreen({
       title: 'AutoIR - Intelligent Log Analysis Platform',
@@ -143,6 +169,25 @@ export default class AutoIR extends Command {
     })
 
     try {
+      // First-run intro overlay
+      const firstRun = !(cfg as any)?.__firstRunCompleted
+      if (firstRun) {
+        const screen = startup.getScreen()
+        const modal = blessed.box({
+          parent: screen,
+          top: 'center', left: 'center', width: '70%', height: '40%',
+          border: {type: 'line'}, label: ' Welcome to AutoIR ', tags: true,
+          style: {fg: 'white', bg: 'black', border: {fg: 'cyan'}},
+          content: '{center}AutoIR will check your TiDB connection, AWS auth, and embedding endpoint.\\n\\nAfter setup, a combined dashboard with built-in semantic search will open.\\n\\nPress any key to continue.{/center}'
+        })
+        screen.render()
+        await new Promise<void>(resolve => screen.once('keypress', () => resolve()))
+        modal.destroy()
+        screen.render()
+        ;(cfg as any).__firstRunCompleted = true
+        await writeConfig(cfg)
+      }
+
       await startup.runStartup()
     } finally {
       startup.cleanup()
@@ -150,46 +195,22 @@ export default class AutoIR extends Command {
   }
 
   private async runDashboard(flags: any): Promise<void> {
-    const screen = blessed.screen({
-      smartCSR: true,
-      title: 'AutoIR - Fargate Dashboard'
-    })
+    const screen = blessed.screen({ smartCSR: true, title: 'AutoIR - Dashboard & Search' })
 
-    // Main container
-    const container = blessed.box({
-      parent: screen,
-      width: '100%',
-      height: '100%',
-      style: {
-        bg: 'black'
-      }
-    })
+    // Main container with two columns: left(search), right(metrics)
+    const container = blessed.box({ parent: screen, width: '100%', height: '100%', style: { bg: 'black' } })
 
-    // Title
-    const title = blessed.box({
-      parent: container,
-      content: '{center}{bold}AutoIR Fargate Dashboard{/bold}{/center}',
-      top: 0,
-      height: 3,
-      width: '100%',
-      tags: true,
-      style: {
-        fg: 'cyan',
-        bg: 'black'
-      }
-    })
+    const title = blessed.box({ parent: container, content: '{center}{bold}AutoIR — Dashboard + Search{/bold}{/center}', top: 0, height: 3, width: '100%', tags: true, style: { fg: 'cyan', bg: 'black' } })
 
-    // Status cards row
-    const statusRow = blessed.box({
-      parent: container,
-      top: 4,
-      left: 0,
-      width: '100%',
-      height: 8,
-      style: {
-        bg: 'black'
-      }
-    })
+    // Left search panel
+    const searchPanel = blessed.box({ parent: container, top: 4, left: 0, width: '60%', height: '90%', style: { bg: 'black' } })
+    const searchLabel = blessed.box({ parent: searchPanel, top: 0, height: 1, width: '100%', content: ' Search (Enter to run) ', tags: true, style: { fg: 'yellow', bg: 'black' } })
+    const searchBox = blessed.textbox({ parent: searchPanel, top: 1, left: 0, width: '100%-2', height: 3, border: {type: 'line'}, inputOnFocus: true, style: {border: {fg: 'cyan'}} })
+    const resultsTable = contrib.table({ parent: searchPanel, top: 5, left: 0, width: '100%', height: '100%-7', label: 'Results', keys: true, fg: 'white', selectedFg: 'white', selectedBg: 'blue', columnWidth: [22, 14, 18, 60] })
+
+    // Right metrics/status panel
+    const statusPanel = blessed.box({ parent: container, top: 4, left: '60%', width: '40%', height: '90%', style: { bg: 'black' } })
+    const statusRow = blessed.box({ parent: statusPanel, top: 0, left: 0, width: '100%', height: 8, style: { bg: 'black' } })
 
     // Service status card
     const serviceStatusCard = blessed.box({
@@ -259,17 +280,7 @@ export default class AutoIR extends Command {
       content: '{center}Loading...{/center}'
     })
 
-    // Charts row
-    const chartsRow = blessed.box({
-      parent: container,
-      top: 13,
-      left: 0,
-      width: '100%',
-      height: 15,
-      style: {
-        bg: 'black'
-      }
-    })
+    const chartsRow = blessed.box({ parent: statusPanel, top: 9, left: 0, width: '100%', height: 15, style: { bg: 'black' } })
 
     // Task count line chart
     const taskChart = contrib.line({
@@ -307,35 +318,9 @@ export default class AutoIR extends Command {
       wholeNumbersOnly: false
     })
 
-    // Tasks table
-    const tasksTable = contrib.table({
-      parent: container,
-      top: 29,
-      left: 0,
-      width: '100%',
-      height: '65%',
-      label: 'Running Tasks',
-      keys: true,
-      fg: 'white',
-      selectedFg: 'white',
-      selectedBg: 'blue',
-      columnSpacing: 2,
-      columnWidth: [25, 15, 15, 12, 12, 15]
-    })
+    const tasksTable = contrib.table({ parent: statusPanel, top: 25, left: 0, width: '100%', height: '100%-26', label: 'Running Tasks', keys: true, fg: 'white', selectedFg: 'white', selectedBg: 'blue', columnSpacing: 2, columnWidth: [25, 15, 15, 12, 12, 15] })
 
-    // Instructions
-    const instructions = blessed.text({
-      parent: container,
-      bottom: 0,
-      height: 1,
-      width: '100%',
-      content: '{center}r to refresh • l to view logs • s to switch to search • q to quit{/center}',
-      tags: true,
-      style: {
-        fg: 'yellow',
-        bg: 'black'
-      }
-    })
+    const instructions = blessed.text({ parent: container, bottom: 0, height: 1, width: '100%', content: '{center}Enter: search • r: refresh metrics • d: daemon setup • q: quit{/center}', tags: true, style: { fg: 'yellow', bg: 'black' } })
 
     // Data storage for charts
     const taskCountHistory: Array<{x: string, y: number}> = []
@@ -498,19 +483,72 @@ ${metrics.memory} MB allocated{/white-fg}{/center}`)
       updateDisplay(metrics)
     }
 
-    // Initial load
+    // Initial loads
     await refreshMetrics()
 
     // Auto-refresh every 30 seconds
     const refreshInterval = setInterval(refreshMetrics, 30000)
 
+    // Search behavior
+    const region = flags['sagemaker-region'] || flags.region || process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION
+    const endpoint = flags['sagemaker-endpoint']
+    const table = flags.table || 'autoir_log_events'
+    const runSearch = async (query: string) => {
+      if (!query || !this.dbPool) return
+      if (!endpoint || !region) {
+        resultsTable.setData({ headers: ['when','group','stream','message'], data: [['-', '-', '-', 'Missing embedding endpoint/region']] })
+        screen.render()
+        return
+      }
+      try {
+        const vec = await this.embedQuerySageMaker(query, endpoint, region)
+        const top = await this.searchByVector(this.dbPool, table, vec, undefined, undefined, 20, 32)
+        const rows = top.map(r => [new Date(r.ts_ms).toISOString(), String(r.log_group||''), String(r.log_stream||''), String(r.message||'').slice(0, 120)])
+        resultsTable.setData({ headers: ['when','group','stream','message'], data: rows })
+        screen.render()
+      } catch (e: any) {
+        resultsTable.setData({ headers: ['when','group','stream','message'], data: [['-', '-', '-', String(e?.message || e)]] })
+        screen.render()
+      }
+    }
+    searchBox.on('submit', async (val: string) => { await runSearch(val) })
+    searchBox.focus()
+
     // Key bindings
     screen.key(['r'], refreshMetrics)
-    
-    screen.key(['s'], async () => {
-      clearInterval(refreshInterval)
-      screen.destroy()
-      this.state = AppState.SEARCH
+
+    screen.key(['d'], async () => {
+      const dlg = blessed.box({ parent: screen, top: 'center', left: 'center', width: '80%', height: '50%', border: {type: 'line'}, label: ' Daemon setup ', style: {fg: 'white', bg: 'black', border: {fg: 'cyan'}}, scrollable: true, keys: true, vi: true })
+      const lg = '/autoir/noise'
+      const regionStr = flags.region || process.env.AWS_REGION || ''
+      const localCmd = `./bin/run.js daemon --groups ${lg} --region ${regionStr} --sagemakerEndpoint ${endpoint} --sagemakerRegion ${region}`
+      const fargateCmd = `./bin/run.js aws autoir-fargate deploy --daemon-log-groups ${lg} --region ${regionStr} --sagemaker-endpoint ${endpoint} --sagemaker-region ${region}`
+      dlg.setContent(
+        'Press L to start local daemon now (background)\n' +
+        'Press F to deploy daemon to ECS Fargate now\n' +
+        '\nSuggested commands:\n' +
+        localCmd + '\n' +
+        fargateCmd + '\n\nPress Esc to close.'
+      )
+      screen.append(dlg); screen.render()
+      const onKey = async (ch: any, key: any) => {
+        if (key.name === 'escape') {
+          for (const k of ['l','L','f','F','escape']) screen.unkey(k, onKey)
+          dlg.destroy(); screen.render(); return }
+        if (key.name === 'l' || key.name === 'L') {
+          try { spawn(process.execPath, ['./bin/run.js','daemon','--groups', lg, '--region', regionStr, '--sagemakerEndpoint', endpoint!, '--sagemakerRegion', region!], {detached: true, stdio: 'ignore'}).unref() } catch {}
+          dlg.setContent(dlg.getContent() + '\nStarted local daemon in background.')
+          screen.render()
+        }
+        if (key.name === 'f' || key.name === 'F') {
+          try {
+            spawn(process.execPath, ['./bin/run.js','aws','autoir-fargate','deploy','--daemon-log-groups', lg, '--region', regionStr, '--sagemaker-endpoint', endpoint!, '--sagemaker-region', region!], {detached: true, stdio: 'ignore'}).unref()
+          } catch {}
+          dlg.setContent(dlg.getContent() + '\nRequested Fargate deployment in background (check CloudFormation).')
+          screen.render()
+        }
+      }
+      screen.key(['l','L','f','F','escape'], onKey)
     })
 
     screen.key(['l'], async () => {
@@ -555,22 +593,8 @@ ${metrics.memory} MB allocated{/white-fg}{/center}`)
   }
 
   private async runSearchInterface(flags: any): Promise<void> {
-    if (!this.dbPool) {
-      throw new Error('Database not initialized')
-    }
-
-    // Create a modified search command that uses our existing pool
-    const searchCommand = new LogsSearch(this.argv, this.config)
-    
-    // Monkey patch the search command to use our pool
-    const originalRun = searchCommand.run.bind(searchCommand)
-    searchCommand.run = async () => {
-      // We'll need to modify the search command to accept an existing pool
-      // For now, let it create its own connection
-      return originalRun()
-    }
-
-    await searchCommand.run()
+    // Deprecated: search is now embedded in the dashboard
+    this.state = AppState.DASHBOARD
   }
 
   private async resolveTiDBConn(flags: any): Promise<{host: string; port?: number; user: string; password?: string; database: string}> {
@@ -592,5 +616,58 @@ ${metrics.memory} MB allocated{/white-fg}{/center}`)
     if (this.dbPool) {
       await this.dbPool.end()
     }
+  }
+
+  private async embedQuerySageMaker(query: string, endpoint: string, region?: string): Promise<number[]> {
+    const client = new SageMakerRuntimeClient({region: region || process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION})
+    const payload = {inputs: query}
+    const cmd = new InvokeEndpointCommand({
+      EndpointName: endpoint,
+      Body: new TextEncoder().encode(JSON.stringify(payload)),
+      ContentType: 'application/json',
+      Accept: 'application/json',
+    })
+    const resp = await client.send(cmd)
+    const body = Buffer.from(resp.Body as Uint8Array).toString('utf8')
+    const data = JSON.parse(body)
+    const vec: number[] = Array.isArray(data) ? (Array.isArray(data[0]) ? data[0] : data) : (Array.isArray(data.embeddings) ? data.embeddings : [])
+    if (!Array.isArray(vec) || vec.length === 0) throw new Error('Embedding endpoint returned no vector')
+    return vec.map((v: any) => Number(v))
+  }
+
+  private async searchByVector(
+    pool: mysql.Pool,
+    table: string,
+    qVec: number[],
+    group: string | undefined,
+    since: string | undefined,
+    limit: number,
+    minLen: number,
+  ): Promise<Array<{id: string; log_group: string; log_stream: string; ts_ms: number; message: string; distance: number}>> {
+    const where: string[] = ['CHAR_LENGTH(message) >= ?']
+    const params: any[] = [minLen]
+    if (group) { where.push('log_group = ?'); params.push(group) }
+    if (since) {
+      const ms = this.parseSince(since)
+      if (ms) { where.push('ts_ms >= ?'); params.push(ms) }
+    }
+    const sql = `SELECT id, log_group, log_stream, ts_ms, message,
+      1 - (embedding <=> CAST(? AS VECTOR(384))) AS score,
+      (embedding <=> CAST(? AS VECTOR(384))) AS distance
+      FROM \`${table}\`
+      ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+      ORDER BY distance ASC
+      LIMIT ?`
+    const [rows] = await pool.query(sql, [JSON.stringify(qVec), JSON.stringify(qVec), ...params, limit])
+    return rows as any
+  }
+
+  private parseSince(expr: string): number | undefined {
+    const m = /^([0-9]+)([smhd])$/.exec(String(expr||''))
+    if (!m) return undefined
+    const n = Number(m[1])
+    const unit = m[2]
+    const ms = unit === 's' ? n*1000 : unit === 'm' ? n*60_000 : unit === 'h' ? n*3_600_000 : n*86_400_000
+    return Date.now() - ms
   }
 }
