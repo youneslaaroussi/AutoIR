@@ -2,10 +2,9 @@ import {BaseTool, Tool, ToolCall} from './base-tool.js'
 import {TimeTool} from './time-tool.js'
 import {CalculatorTool} from './calculator-tool.js'
 import {FileReadTool, FileWriteTool} from './file-tool.js'
-import {WebSearchTool} from './web-search-tool.js'
+// import {WebSearchTool} from './web-search-tool.js'
 import {TiDBQueryTool} from './tidb-tool.js'
 import {AnalysisTool} from './analysis-tool.js'
-import ora from 'ora'
 
 export class ToolManager {
   private tools: Map<string, BaseTool> = new Map()
@@ -19,7 +18,7 @@ export class ToolManager {
     this.registerTool(new CalculatorTool())
     this.registerTool(new FileReadTool())
     this.registerTool(new FileWriteTool())
-    this.registerTool(new WebSearchTool())
+    // Web search disabled per product requirements
     this.registerTool(new TiDBQueryTool())
     this.registerTool(new AnalysisTool())
   }
@@ -42,14 +41,11 @@ export class ToolManager {
       throw new Error(`Unknown tool: ${toolCall.name}`)
     }
 
-    const sp = ora(`Executing ${toolCall.name}...`).start()
-    
     try {
       const result = await tool.execute(toolCall.arguments)
-      sp.succeed(`Executed ${toolCall.name}`)
       return result
     } catch (error: any) {
-      sp.fail(`Failed to execute ${toolCall.name}`)
+      // Surface error to caller; UI should handle display
       throw error
     }
   }

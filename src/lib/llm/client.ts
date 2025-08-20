@@ -104,32 +104,203 @@ export class LlmClient {
 
   private async callKimiK2(endpoint: string, prompt: string, options: LlmOptions): Promise<any> {
     const payload = {prompt, temperature: options.temperature, min_p: 0.01, n_predict: options.maxTokens, stream: options.stream}
-    const {stdout} = await execFileAsync('curl', ['-s', '-f', '-X', 'POST', '-H', 'Content-Type: application/json', '-d', JSON.stringify(payload), `${endpoint}/completion`])
-    const response = JSON.parse(stdout)
-    return {content: response.content || '', tool_calls: response.tool_calls || [], raw: response}
+    try {
+      const {stdout} = await execFileAsync('curl', ['-s', '-X', 'POST', '-H', 'Content-Type: application/json', '-d', JSON.stringify(payload), `${endpoint}/completion`])
+      const response = JSON.parse(stdout)
+      return {content: response.content || '', tool_calls: response.tool_calls || [], raw: response}
+    } catch (e: any) {
+      const msg = e?.stderr || e?.message || String(e)
+      return {content: `Error: ${msg}`, tool_calls: undefined, raw: {error: msg}}
+    }
+  }
+
+  private async callKimiK2Stream(endpoint: string, prompt: string, options: LlmOptions, onToken: (t: string) => void): Promise<string> {
+    const payload = {prompt, temperature: options.temperature, min_p: 0.01, n_predict: options.maxTokens, stream: true}
+    const args = [
+      '-s', '-N', '-X', 'POST',
+      '-H', 'Content-Type: application/json',
+      '-d', JSON.stringify(payload),
+      `${endpoint}/completion`
+    ]
+    return await new Promise<string>((resolve) => {
+      const {spawn} = require('node:child_process') as typeof import('node:child_process')
+      const child = spawn('curl', args)
+      let final = ''
+      let buffer = ''
+      const processLine = (line: string) => {
+        const trimmed = line.trim()
+        if (!trimmed) return
+        // Support SSE-style lines (data: {...}) and raw JSON lines
+        const jsonPart = trimmed.startsWith('data:') ? trimmed.slice(5).trim() : trimmed
+        if (jsonPart === '[DONE]') { try { child.kill() } catch {} ; return }
+        try {
+          const obj = JSON.parse(jsonPart)
+          const token = typeof obj?.content === 'string' ? obj.content : (typeof obj?.delta === 'string' ? obj.delta : '')
+          if (token) { final += token; onToken(token) }
+        } catch {
+          // Fallback: treat as plain text chunk
+          final += jsonPart
+          onToken(jsonPart)
+        }
+      }
+      child.stdout.on('data', (chunk: Buffer) => {
+        buffer += chunk.toString()
+        let idx
+        while ((idx = buffer.indexOf('\n')) >= 0) {
+          const line = buffer.slice(0, idx)
+          buffer = buffer.slice(idx + 1)
+          processLine(line)
+        }
+      })
+      child.on('close', () => resolve(final))
+      child.on('error', () => resolve(final))
+    })
   }
 
   private async callOpenAI(messages: LlmMessage[], options: LlmOptions): Promise<any> {
     if (!this.openaiApiKey) throw new Error('OpenAI API key missing')
-    const payload = {model: this.openaiModel, temperature: options.temperature, max_tokens: options.maxTokens, messages: messages.filter(m => m.role !== 'tool').map(m => ({role: m.role as any, content: m.content}))}
-    const {stdout} = await execFileAsync('curl', ['-s', '-f', '-X', 'POST', '-H', 'Content-Type: application/json', '-H', `Authorization: Bearer ${this.openaiApiKey}`, '-d', JSON.stringify(payload), 'https://api.openai.com/v1/chat/completions'])
-    const response = JSON.parse(stdout)
-    const content = response?.choices?.[0]?.message?.content || ''
-    return {content, raw: response}
+    // Expose only approved tools to OpenAI
+    const allowed = this.toolManager.getAllTools().filter(t => ['tidb_query','analysis','get_current_time','calculate','read_file','write_file'].includes(t.name))
+    const openAiTools = allowed.map(t => ({
+      type: 'function',
+      function: { name: t.name, description: t.description, parameters: t.parameters }
+    }))
+    const openAiMessages = messages.map(m => {
+      if (m.role === 'tool' && m.tool_results && m.tool_results[0]?.call_id) {
+        return { role: 'tool', tool_call_id: m.tool_results[0].call_id, content: m.content }
+      }
+      if (m.role === 'assistant' && (m as any).tool_calls && (m as any).tool_calls.length > 0) {
+        const tcs = (m as any).tool_calls as ToolCall[]
+        return {
+          role: 'assistant',
+          content: m.content || '',
+          tool_calls: tcs.map(tc => ({ id: tc.id, type: 'function', function: { name: tc.name, arguments: JSON.stringify(tc.arguments) } }))
+        } as any
+      }
+      return { role: m.role as any, content: m.content }
+    })
+    const payload = { model: this.openaiModel, temperature: options.temperature, max_tokens: options.maxTokens, tools: openAiTools, tool_choice: 'auto', messages: openAiMessages }
+    try {
+      const {stdout} = await execFileAsync('curl', ['-s', '-X', 'POST', '-H', 'Content-Type: application/json', '-H', `Authorization: Bearer ${this.openaiApiKey}`, '-d', JSON.stringify(payload), 'https://api.openai.com/v1/chat/completions'])
+      const response = JSON.parse(stdout)
+      const msg = response?.choices?.[0]?.message
+      const content = msg?.content || ''
+      // Map tool calls if any
+      const toolCalls: ToolCall[] | undefined = msg?.tool_calls?.map((tc: any) => ({
+        id: tc.id,
+        name: tc.function?.name,
+        arguments: safeParseJson(tc.function?.arguments)
+      }))
+      return {content, tool_calls: toolCalls, raw: response}
+    } catch (e: any) {
+      const msg = e?.stderr || e?.message || String(e)
+      return {content: `Error: ${msg}`, tool_calls: undefined, raw: {error: msg}}
+    }
   }
 
-  async handleToolCycle(messages: LlmMessage[], options: LlmOptions): Promise<{messages: LlmMessage[]; final: string}> {
-    const first = await this.send(messages, options)
-    messages.push({role: 'assistant', content: first.content || '', tool_calls: first.tool_calls})
-    if (first.tool_calls && first.tool_calls.length > 0) {
-      for (const toolCall of first.tool_calls) {
-        const result = await this.toolManager.executeTool(toolCall)
-        messages.push({role: 'tool', content: result, tool_results: [{call_id: toolCall.id, result}]})
-      }
-      const follow = await this.send(messages, options)
-      messages.push({role: 'assistant', content: follow.content || ''})
-      return {messages, final: follow.content || ''}
+  async handleToolCycle(
+    messages: LlmMessage[],
+    options: LlmOptions,
+    observer?: {
+      onToolStart?: (call: ToolCall) => void
+      onToolResult?: (call: ToolCall, result: string) => void
+      onToolError?: (call: ToolCall, error: any) => void
+      onStreamStart?: () => void
+      onStreamToken?: (token: string) => void
+      onStreamEnd?: () => void
     }
-    return {messages, final: first.content || ''}
+  ): Promise<{messages: LlmMessage[]; final: string}> {
+    let finalContent = ''
+    let steps = 0
+    while (steps++ < 8) {
+      const resp = await this.send(messages, options)
+      if (resp.content) finalContent = resp.content
+      messages.push({role: 'assistant', content: resp.content || '', tool_calls: resp.tool_calls})
+
+      const calls = resp.tool_calls || []
+      if (!calls.length) break
+
+      for (const toolCall of calls) {
+        try {
+          observer?.onToolStart?.(toolCall)
+          const result = await this.toolManager.executeTool(toolCall)
+          observer?.onToolResult?.(toolCall, result)
+          messages.push({role: 'tool', content: result, tool_results: [{call_id: toolCall.id, result}]})
+        } catch (e: any) {
+          const err = e?.message || String(e)
+          const result = JSON.stringify({error: err})
+          observer?.onToolError?.(toolCall, err)
+          messages.push({role: 'tool', content: result, tool_results: [{call_id: toolCall.id, result}]})
+        }
+      }
+      // Loop to ask the model again with tool results
+      continue
+    }
+    // Final response without tool calls. Optionally stream it
+    if (options.stream && observer?.onStreamToken) {
+      if (this.provider === 'openai') {
+        observer.onStreamStart?.()
+        const streamed = await this.callOpenAIStream(messages, observer.onStreamToken)
+        observer.onStreamEnd?.()
+        finalContent = streamed
+        messages.push({role: 'assistant', content: finalContent})
+      } else if (this.provider === 'aws' && this.endpoint) {
+        observer.onStreamStart?.()
+        const prompt = this.buildKimiPrompt(messages, this.toolManager.getAllTools())
+        const streamed = await this.callKimiK2Stream(this.endpoint, prompt, options, observer.onStreamToken)
+        observer.onStreamEnd?.()
+        finalContent = streamed
+        messages.push({role: 'assistant', content: finalContent})
+      }
+    }
+    return {messages, final: finalContent}
   }
+
+  private async callOpenAIStream(messages: LlmMessage[], onToken: (t: string) => void): Promise<string> {
+    const payload = {
+      model: this.openaiModel,
+      stream: true,
+      messages: messages.map(m => ({role: m.role as any, content: m.content}))
+    }
+    const args = [
+      '-s', '-N', '-X', 'POST',
+      '-H', 'Content-Type: application/json',
+      '-H', `Authorization: Bearer ${this.openaiApiKey}`,
+      '-d', JSON.stringify(payload),
+      'https://api.openai.com/v1/chat/completions'
+    ]
+    return await new Promise<string>((resolve) => {
+      const {spawn} = require('node:child_process') as typeof import('node:child_process')
+      const child = spawn('curl', args)
+      let final = ''
+      let buffer = ''
+      child.stdout.on('data', (chunk: Buffer) => {
+        buffer += chunk.toString()
+        let idx
+        while ((idx = buffer.indexOf('\n')) >= 0) {
+          const line = buffer.slice(0, idx).trim()
+          buffer = buffer.slice(idx + 1)
+          if (!line.startsWith('data:')) continue
+          const data = line.slice(5).trim()
+          if (data === '[DONE]') { child.kill(); break }
+          try {
+            const json = JSON.parse(data)
+            const delta = json?.choices?.[0]?.delta
+            const token = delta?.content || ''
+            if (token) {
+              final += token
+              onToken(token)
+            }
+          } catch {}
+        }
+      })
+      child.on('close', () => resolve(final))
+      child.on('error', () => resolve(final))
+    })
+  }
+}
+
+function safeParseJson(s: string | undefined): Record<string, any> {
+  if (!s) return {}
+  try { return JSON.parse(s) } catch { return {} }
 }

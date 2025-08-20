@@ -16,12 +16,18 @@ export class TiDBQueryTool extends BaseTool {
 
   async execute(args: Record<string, any>): Promise<string> {
     this.validateArguments(args)
-    const sql: string = args.sql
+    let sql: string = String(args.sql || '')
     const limit: number = Math.min(Number(args.limit ?? 100), 1000)
 
     if (!/^\s*select\s/i.test(sql)) {
       throw new Error('Only SELECT statements are allowed')
     }
+
+    // Sanitize: strip trailing semicolons and whitespace
+    sql = sql.trim().replace(/;\s*$/g, '')
+    // Avoid double LIMIT: append only if not present (basic heuristic)
+    const hasLimit = /\blimit\b/i.test(sql)
+    const finalSql = hasLimit ? sql : `${sql} LIMIT ${limit}`
 
     const profile = await getTiDBProfile('default')
     if (!profile) throw new Error('TiDB profile not configured. Run main app to set it.')
@@ -38,10 +44,10 @@ export class TiDBQueryTool extends BaseTool {
     })
 
     try {
-      const [rows] = await pool.query({sql: `${sql} LIMIT ${limit}`, rowsAsArray: false})
+      const [rows] = await pool.query(finalSql)
       const json = JSON.stringify(rows)
       const score = Array.isArray(rows) ? rows.length : 0
-      return JSON.stringify({rows: JSON.parse(json), score, meta: {limit}})
+      return JSON.stringify({rows: JSON.parse(json), score, meta: {limit, appliedLimit: !hasLimit}})
     } finally {
       await pool.end()
     }

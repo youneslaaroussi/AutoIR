@@ -333,23 +333,20 @@ export default class LlmChat extends Command {
       content: message
     })
 
-    // Build and send
-    const response = await this.llm.send(conversation.messages as unknown as LlmMessage[], options)
-    
-    // Handle tool calls if present
-    if (response.tool_calls && response.tool_calls.length > 0) {
-      await this.handleToolCalls(conversation, response, options)
-    } else {
-      // Add assistant response
-      conversation.messages.push({
-        role: 'assistant',
-        content: response.content
-      })
-      
-      if (!options.json) {
-        this.log(chalk.green('Assistant: ') + response.content)
-      }
-    }
+    // Build and send with optional streaming via handleToolCycle
+    let didStream = false
+    const {final} = await this.llm.handleToolCycle(conversation.messages as unknown as LlmMessage[], options, {
+      onToolStart: (call) => { if (!options.json) this.log(chalk.yellow('Tool start: ') + `${call.name} ${JSON.stringify(call.arguments)}`) },
+      onToolResult: (call, result) => { if (!options.json) this.log(chalk.green('Tool result: ') + `${call.name}: ${result}`) },
+      onToolError: (call, err) => { if (!options.json) this.log(chalk.red('Tool error: ') + `${call.name}: ${err}`) },
+      onStreamStart: () => { didStream = true; if (!options.json) this.log(chalk.green('Assistant: ')) },
+      onStreamToken: (t) => { if (!options.json) process.stdout.write(t) },
+      onStreamEnd: () => { if (!options.json) process.stdout.write('\n') }
+    })
+
+    // Persist assistant message
+    conversation.messages.push({ role: 'assistant', content: final })
+    if (!options.json && !didStream) this.log(chalk.green('Assistant: ') + final)
 
     await this.saveConversation(conversation)
   }

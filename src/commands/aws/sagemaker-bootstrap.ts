@@ -56,14 +56,26 @@ export default class AwsSageMakerBootstrap extends Command {
     const pol1 = ['iam', 'attach-role-policy', '--role-name', roleName, '--policy-arn', 'arn:aws:iam::aws:policy/AmazonSageMakerFullAccess', ...base]
     const pol2 = ['iam', 'attach-role-policy', '--role-name', roleName, '--policy-arn', 'arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly', ...base]
     await this.runAws(createRole, flags['dry-run'], flags.debug, {okCodes: ['EntityAlreadyExists']})
+    // Always enforce correct trust policy in case the role existed but had wrong trust
+    const updateTrust = ['iam', 'update-assume-role-policy', '--role-name', roleName, '--policy-document', trustStr, ...base]
+    await this.runAws(updateTrust, flags['dry-run'], flags.debug)
     await this.runAws(pol1, flags['dry-run'], flags.debug)
     await this.runAws(pol2, flags['dry-run'], flags.debug)
+    // Small delay for IAM propagation
+    await new Promise(r => setTimeout(r, 3000))
     spRole.succeed('Execution role ready')
 
     // 2) Determine DLC image (HF pytorch inference) for region (use common account id 763104351884 where available)
     const account = '763104351884'
-    const imageCandidates = flags.image ? [flags.image] : [
-      `${account}.dkr.ecr.${region}.amazonaws.com/huggingface-pytorch-inference:2.3.0-transformers4.41.2-cpu-py310-ubuntu22.04`,
+    let chosenImage = flags.image
+    if (!chosenImage) {
+      try {
+        chosenImage = await this.pickAvailableCpuDlcImage(region, account, flags['dry-run'], flags.debug)
+      } catch (e: any) {
+        this.log(chalk.yellow(`Falling back to known DLC images: ${e?.message || e}`))
+      }
+    }
+    const imageCandidates = chosenImage ? [chosenImage] : [
       `${account}.dkr.ecr.${region}.amazonaws.com/huggingface-pytorch-inference:2.1.0-transformers4.37.0-cpu-py310-ubuntu22.04`,
       `${account}.dkr.ecr.${region}.amazonaws.com/huggingface-pytorch-inference:1.13.1-transformers4.26.0-cpu-py39-ubuntu20.04`,
     ]
@@ -73,20 +85,26 @@ export default class AwsSageMakerBootstrap extends Command {
     const env = {HF_MODEL_ID: modelId, HF_TASK: 'feature-extraction'}
     const roleArn = `arn:aws:iam::${await this.accountId(base)}:role/${roleName}`
     const spModel = ora('Creating SageMaker model').start()
+    // Reuse existing model if present; otherwise create with first valid image
     let modelCreated = false
-    for (const image of imageCandidates) {
-      const createModel = ['sagemaker', 'create-model', '--model-name', modelName, '--primary-container', JSON.stringify({Image: image, Environment: env}), '--execution-role-arn', roleArn, ...base]
-      const res = await this.runAws(createModel, flags['dry-run'], flags.debug)
-      if (res.ok) {
-        spModel.succeed(`Model ready (${image})`)
-        modelCreated = true
-        break
+    try {
+      await execFileAsync('aws', ['sagemaker','describe-model','--model-name', modelName, ...base])
+      spModel.succeed('Model already exists; reusing')
+      modelCreated = true
+    } catch {
+      for (const image of imageCandidates) {
+        const createModel = ['sagemaker', 'create-model', '--model-name', modelName, '--primary-container', JSON.stringify({Image: image, Environment: env}), '--execution-role-arn', roleArn, ...base]
+        const res = await this.runAws(createModel, flags['dry-run'], flags.debug, {okCodes: ['Already exists', 'already existing', 'Cannot create already existing model']})
+        if (res.ok) {
+          spModel.succeed(`Model ready (${image})`)
+          modelCreated = true
+          break
+        }
+        if (flags.debug && res.stderr) this.log(chalk.gray(res.stderr))
       }
-      if (flags.debug && res.stderr) this.log(chalk.gray(res.stderr))
-      // try next candidate on image-not-found
     }
     if (!modelCreated) {
-      spModel.fail('Failed to create model: no valid DLC image found')
+      spModel.fail('Failed to create or reuse model. No valid DLC image found.')
       this.log('Pass a working image URI with --image (see AWS DLCs for your region).')
       return
     }
@@ -121,7 +139,17 @@ export default class AwsSageMakerBootstrap extends Command {
         const status = data?.EndpointStatus
         spWait.text = `Waiting for endpoint to be InService... (status: ${status})`
         if (status === 'InService') break
-        if (status === 'Failed') throw new Error(data?.FailureReason || 'Endpoint failed')
+        if (status === 'Failed') {
+          // Attempt one automatic repair: delete endpoint and recreate
+          if (!flags['dry-run']) {
+            try {
+              await this.runAws(['sagemaker','delete-endpoint','--endpoint-name', endpoint, ...base], false, flags.debug)
+              await sleep(5000)
+              await this.runAws(['sagemaker','create-endpoint','--endpoint-name', endpoint, '--endpoint-config-name', configName, ...base], false, flags.debug)
+            } catch {}
+          }
+          // Continue loop to wait again
+        }
       } catch (e: any) {
         // NotFound during provisioning is expected for a short while
         const msg = e?.message || String(e)
@@ -135,7 +163,7 @@ export default class AwsSageMakerBootstrap extends Command {
     try {
       const spTest = ora('Testing endpoint with sample payload').start()
       const body = JSON.stringify({inputs: 'hello world'})
-      await execFileAsync('aws', ['sagemaker-runtime', 'invoke-endpoint', '--endpoint-name', endpoint, '--content-type', 'application/json', '--accept', 'application/json', '--body', body, ...base, 'out.json'])
+      await execFileAsync('aws', ['sagemaker-runtime', 'invoke-endpoint', '--endpoint-name', endpoint, '--content-type', 'application/json', '--accept', 'application/json', '--cli-binary-format', 'raw-in-base64-out', '--body', body, ...base, 'out.json'])
       spTest.succeed('Test invoke succeeded')
       const {stdout: cat} = await execFileAsync('cat', ['out.json'])
       this.log('Preview: ' + cat.slice(0, 200) + (cat.length > 200 ? ' ...' : ''))
@@ -179,6 +207,37 @@ export default class AwsSageMakerBootstrap extends Command {
       return '000000000000'
     }
   }
+
+  private async pickAvailableCpuDlcImage(region: string, registryId: string, dryRun: boolean, debug: boolean): Promise<string> {
+    if (dryRun) {
+      return `${registryId}.dkr.ecr.${region}.amazonaws.com/huggingface-pytorch-inference:2.1.0-transformers4.37.0-cpu-py310-ubuntu22.04`
+    }
+    const {stdout} = await execFileAsync('aws', [
+      'ecr','describe-images',
+      '--registry-id', registryId,
+      '--repository-name', 'huggingface-pytorch-inference',
+      '--region', region,
+      '--output','json'
+    ])
+    const data = JSON.parse(stdout)
+    const tags: string[] = []
+    for (const d of (data.imageDetails || [])) {
+      for (const t of (d.imageTags || [])) tags.push(String(t))
+    }
+    const cpuTags = tags.filter(t => /cpu/i.test(t) && /transformers/i.test(t))
+    if (cpuTags.length === 0) throw new Error('No CPU DLC tags found in region')
+    // Prefer newest transformers version then python version
+    const parsed = cpuTags.map(t => ({
+      tag: t,
+      trans: parseFloat((/transformers(\d+\.\d+\.\d+)/.exec(t)?.[1] || '0').replace(/\./g, '.')),
+      py: parseFloat((/py(\d+)/.exec(t)?.[1] || '0'))
+    }))
+    parsed.sort((a,b)=> (b.trans - a.trans) || (b.py - a.py) || (a.tag < b.tag ? 1 : -1))
+    const selected = parsed[0]?.tag || cpuTags.sort().reverse()[0]
+    return `${registryId}.dkr.ecr.${region}.amazonaws.com/huggingface-pytorch-inference:${selected}`
+  }
 }
+
+function sleep(ms: number): Promise<void> { return new Promise(r => setTimeout(r, ms)) }
 
 

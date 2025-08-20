@@ -1,12 +1,17 @@
 import {Command, Flags} from '@oclif/core'
 import mysql from 'mysql2/promise'
 import {SageMakerRuntimeClient, InvokeEndpointCommand} from '@aws-sdk/client-sagemaker-runtime'
+import {CloudWatchLogsClient, DescribeLogGroupsCommand} from '@aws-sdk/client-cloudwatch-logs'
 import {spawn} from 'node:child_process'
 import {getTiDBProfile, parseMySqlDsn} from '../../lib/config.js'
 import blessed from 'blessed'
+import contrib from 'blessed-contrib'
 import inquirer from 'inquirer'
 import {ToolManager} from '../../lib/tools/index.js'
 import {LlmClient, LlmMessage} from '../../lib/llm/client.js'
+import clipboard from 'clipboardy'
+import {randomUUID} from 'node:crypto'
+import {markdownToBlessed} from '../../lib/markdown.js'
 
 type SearchResult = {
   id: string
@@ -198,6 +203,32 @@ export default class LogsSearch extends Command {
       content: 'No background tail running yet.'
     })
 
+    // Charts: sparkline for ingestion rate and bar for errors
+    const chartsBox = blessed.box({
+      parent: tailLogsBox,
+      top: 1,
+      left: 1,
+      width: '100%-2',
+      height: 7,
+      style: {fg: 'white', bg: 'black'}
+    })
+    const spark = contrib.sparkline({
+      label: 'Ingested rows/min',
+      tags: true,
+      style: {fg: 'green'}
+    }) as unknown as blessed.Widgets.BoxElement
+    chartsBox.append(spark as any)
+    const errorsBox = blessed.box({
+      parent: tailLogsBox,
+      top: 8,
+      left: 1,
+      width: '100%-2',
+      height: 3,
+      content: '{red-fg}Errors (last 5):{/red-fg}',
+      tags: true,
+      style: {fg: 'white', bg: 'black'}
+    })
+
     // Chat panel (container)
     const chatPanel = blessed.box({
       parent: container,
@@ -272,6 +303,7 @@ export default class LogsSearch extends Command {
 
         // Search
         const results = await this.searchByVector(pool, flags.table!, qVec, undefined, undefined, 20, 10)
+        lastResultsCache = results
         
         statusBox.setContent(`Found ${results.length} results`)
         
@@ -293,7 +325,9 @@ export default class LogsSearch extends Command {
           ;(resultsList as any).searchResults = results
         }
       } catch (e: any) {
-        statusBox.setContent(`ERROR: ${e.message}`)
+        const msg = e?.message || String(e)
+        statusBox.setContent(`ERROR: ${msg}`)
+        lastErrors.push({ts: Date.now(), msg: `[search] ${msg}`})
       }
       
       screen.render()
@@ -309,9 +343,12 @@ export default class LogsSearch extends Command {
 
     const appendChat = (prefix: string, text: string) => {
       const old = chatTranscript.getContent() || ''
-      const next = `${old}${old ? '\n' : ''}${prefix}${text}`
+      const rendered = markdownToBlessed(text)
+      // For streaming tokens (prefix === ''), append inline to current line without forcing a new line.
+      const next = `${old}${prefix ? (old ? '\n' : '') + prefix : ''}${rendered}`
       chatTranscript.setContent(next)
       chatTranscript.setScrollPerc(100)
+      screen.render()
     }
 
     const sendChat = async (input: string) => {
@@ -327,15 +364,29 @@ export default class LogsSearch extends Command {
         }
         return originalExecute(toolCall)
       }
-      const {final} = await llm.handleToolCycle(conversation, {temperature: 0.6, maxTokens: 500})
-      appendChat('{green-fg}Assistant:{/green-fg} ', final)
-      screen.render()
+      let didStream = false
+      const {final} = await llm.handleToolCycle(conversation, {temperature: 0.6, maxTokens: 500, stream: true}, {
+        onToolStart: (call) => appendChat('{yellow-fg}Tool start:{/yellow-fg} ', `${call.name} ${JSON.stringify(call.arguments)}`),
+        onToolResult: (call, result) => appendChat('{green-fg}Tool result:{/green-fg} ', `${call.name}: ${result}`),
+        onToolError: (call, err) => appendChat('{red-fg}Tool error:{/red-fg} ', `${call.name}: ${err}`)
+        ,
+        onStreamStart: () => { didStream = true; appendChat('{gray-fg}Assistant:{/gray-fg} ', '') },
+        onStreamToken: (t) => appendChat('', t),
+        onStreamEnd: () => {}
+      })
+      if (!didStream) {
+        appendChat('{green-fg}Assistant:{/green-fg} ', final)
+      }
     }
 
     // Background tail setup
     const sanitizeAnsi = (s: string) => s.replace(/\u001b\[[0-9;]*m/g, '')
     let tailChild: ReturnType<typeof spawn> | null = null
     let tailBuffer: string[] = []
+    let lastErrors: Array<{ts: number; msg: string}> = []
+    let lastResultsCache: Array<SearchResult & {distance: number}> = []
+    const sessionId = randomUUID()
+    const ingestBatches: Array<{ts: number; count: number}> = []
     const appendTail = (line: string) => {
       const clean = sanitizeAnsi(line).trimEnd()
       if (!clean) return
@@ -346,16 +397,27 @@ export default class LogsSearch extends Command {
       screen.render()
     }
 
-    const startTail = async () => {
-      const ans = await inquirer.prompt<{group?: string}>([{
-        type: 'input',
-        name: 'group',
-        message: 'CloudWatch log group to tail in background (leave blank to skip):',
-        default: ''
-      }])
-      const group = (ans.group || '').trim()
+    // Update charts periodically
+    setInterval(() => {
+      // Ingestion sparkline: compute rows per minute from tailBuffer heuristics
+      const now = Date.now()
+      const windowMs = 5 * 60 * 1000
+      const buckets = new Array(5).fill(0)
+      for (const e of ingestBatches) {
+        if (now - e.ts > windowMs) continue
+        const idx = Math.min(4, Math.floor((now - e.ts) / (60 * 1000)))
+        buckets[4 - idx] += e.count
+      }
+      ;(spark as any).setData(['Ingest'], [buckets.map((v: number) => Number(v))])
+      // Errors summary
+      const last5 = lastErrors.slice(-5).map(e => e.msg)
+      errorsBox.setContent('{red-fg}Errors (last 5):{/red-fg}\n' + (last5.join('\n') || 'None'))
+      screen.render()
+    }, 3000)
+
+    const startTail = async (group: string) => {
       if (!group) {
-        appendTail('Skipping background tail. Press t to focus here later.')
+        appendTail('Skipping background tail. Press g to choose a log group later.')
         return
       }
       const args = ['logs', 'tail', group]
@@ -378,11 +440,110 @@ export default class LogsSearch extends Command {
       })
       tailChild.stderr?.on('data', (d) => {
         const str = d.toString()
-        for (const line of str.split('\n')) appendTail(line)
+        for (const line of str.split('\n')) {
+          appendTail(line)
+          if (/error/i.test(line)) lastErrors.push({ts: Date.now(), msg: line})
+        }
       })
       tailChild.on('close', (code) => {
         appendTail(`Tail process exited with code ${code}`)
       })
+    }
+
+    // CloudWatch log group picker (TUI modal)
+    const openTailPicker = async () => {
+      const overlay = blessed.box({
+        parent: screen,
+        top: 'center',
+        left: 'center',
+        width: '70%',
+        height: '70%',
+        label: ' Select CloudWatch Log Group ',
+        border: {type: 'line'},
+        style: {fg: 'white', bg: 'black', border: {fg: 'blue'}},
+        keys: true,
+        mouse: true,
+        tags: true
+      })
+      const filter = blessed.textbox({
+        parent: overlay,
+        label: ' Filter ',
+        top: 1,
+        left: 1,
+        width: '100%-2',
+        height: 3,
+        border: {type: 'line'},
+        inputOnFocus: true,
+        keys: true,
+        style: {fg: 'white', bg: 'black', border: {fg: 'blue'}, focus: {border: {fg: 'yellow'}}}
+      })
+      const list = blessed.list({
+        parent: overlay,
+        top: 5,
+        left: 1,
+        width: '100%-2',
+        height: '100%-6',
+        border: {type: 'line'},
+        keys: true,
+        vi: true,
+        mouse: true,
+        style: {fg: 'white', bg: 'black', selected: {bg: 'blue', fg: 'white'}, border: {fg: 'blue'}}
+      })
+
+      const cwClient = new CloudWatchLogsClient({region: flags.region || process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION})
+      const allGroups: string[] = []
+      try {
+        let nextToken: string | undefined = undefined
+        while (true) {
+          const respRes: any = await cwClient.send(new DescribeLogGroupsCommand({nextToken}))
+          const names = (respRes.logGroups || []).map((g: any) => g.logGroupName as string).filter(Boolean)
+          allGroups.push(...names)
+          nextToken = respRes.nextToken as string | undefined
+          if (!nextToken) break
+        }
+      } catch (e: any) {
+        // Fallback info
+        allGroups.push('/aws/lambda/your-func', '/aws/ecs/your-service')
+      }
+
+      const applyFilter = (q: string) => {
+        const ql = q.toLowerCase().trim()
+        const items = allGroups.filter(n => !ql || n.toLowerCase().includes(ql))
+        list.setItems(items.length ? items : ['<no matches>'])
+        list.select(0)
+        screen.render()
+      }
+      applyFilter('')
+
+      // Keyboard bindings for filter
+      filter.key(['escape'], () => { overlay.destroy(); screen.render() })
+      filter.key(['down', 'tab'], () => { list.focus(); screen.render() })
+      filter.on('keypress', () => {
+        // Defer read of textbox value so it includes the latest character
+        setTimeout(() => {
+          const val = (filter as any).getValue ? (filter as any).getValue() : (filter as any).value || ''
+          applyFilter(String(val))
+        }, 0)
+      })
+
+      // Keyboard bindings for list
+      list.key(['escape'], () => { overlay.destroy(); screen.render() })
+      list.key(['up'], () => {
+        if ((list as any).selected === 0) { filter.focus(); screen.render() }
+      })
+      list.key(['enter'], async () => {
+        const idx = (list as any).selected || 0
+        const items = (list as any).items || []
+        const item = items[idx]
+        const name = item?.getText ? item.getText() : String(item?.content || '')
+        if (!name || name === '<no matches>') return
+        overlay.destroy()
+        screen.render()
+        await startTail(name)
+      })
+
+      // Focus filter after render tick to ensure overlay is ready
+      setTimeout(() => { filter.focus(); screen.render() }, 0)
     }
 
     // Event handlers
@@ -436,6 +597,11 @@ ${result.message}`
       tailLogsBox.focus()
     })
 
+    // Open tail picker
+    screen.key(['g'], () => {
+      openTailPicker().catch(() => {})
+    })
+
     // Ask about selected result
     screen.key(['a'], () => {
       const results = (resultsList as any).searchResults
@@ -457,8 +623,35 @@ ${result.message}`
     // Initial focus and render
     searchBox.focus()
     screen.render()
-    // Start background tail prompt on startup
-    startTail().catch(() => {})
+    // Start background tail picker on startup
+    openTailPicker().catch(() => {})
+
+    // Diagnostics copy (key: d)
+    screen.key(['d'], async () => {
+      const requestId = randomUUID()
+      const diag = {
+        sessionId,
+        requestId,
+        timestamp: new Date().toISOString(),
+        search: {
+          table: flags.table,
+          lastResultsCount: lastResultsCache.length,
+          results: lastResultsCache.slice(0, 50)
+        },
+        tail: {
+          lastLines: tailBuffer.slice(-200)
+        },
+        llm: {
+          provider: llm.getProviderLabel(),
+          conversation
+        },
+        errors: lastErrors.slice(-100)
+      }
+      const text = `AutoIR Diagnostics\nSession: ${sessionId}\nRequest: ${requestId}\nTime: ${new Date().toISOString()}\n\n${JSON.stringify(diag, null, 2)}`
+      await clipboard.write(text)
+      statusBox.setContent('Diagnostics copied to clipboard')
+      screen.render()
+    })
   }
 
   private async resolveTiDBConn(flags: any): Promise<{host: string; port?: number; user: string; password?: string; database: string}> {
