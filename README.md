@@ -225,4 +225,3 @@ Use `--help` on any command for full details.
 - Slack Incoming Webhooks: [api.slack.com/messaging/webhooks](https://api.slack.com/messaging/webhooks)
 
 <img alt="Appendix placeholder: command tree and help excerpts" />
-
