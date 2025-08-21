@@ -17,7 +17,11 @@ export type AppConfig = {
     current?: string
   }
   embed?: {
-    provider?: 'bedrock' | 'none'
+    provider?: 'sagemaker' | 'bedrock' | 'none'
+    // SageMaker embedding endpoint configuration
+    sagemakerEndpoint?: string
+    sagemakerRegion?: string
+    // Bedrock configuration (if used)
     bedrockRegion?: string
     bedrockModel?: string
   }
@@ -28,6 +32,10 @@ export type AppConfig = {
     // For OpenAI backend
     openaiApiKey?: string
     openaiModel?: string
+  }
+  fargate?: {
+    cluster?: string
+    service?: string
   }
 }
 
@@ -105,6 +113,18 @@ export async function getLlmConfig(): Promise<NonNullable<AppConfig['llm']> | un
 export async function setLlmConfig(llm: NonNullable<AppConfig['llm']>): Promise<void> {
   const cfg = await readConfig()
   cfg.llm = llm
+  await writeConfig(cfg)
+}
+
+export async function getFargateConfig(): Promise<NonNullable<AppConfig['fargate']> | undefined> {
+  const cfg = await readConfig()
+  if (!cfg.fargate) return undefined
+  return cfg.fargate
+}
+
+export async function setFargateConfig(fargate: NonNullable<AppConfig['fargate']>): Promise<void> {
+  const cfg = await readConfig()
+  cfg.fargate = fargate
   await writeConfig(cfg)
 }
 

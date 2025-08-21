@@ -1,12 +1,13 @@
 import {Command, Flags} from '@oclif/core'
 import mysql from 'mysql2/promise'
 import {StartupScreen, StartupProcess} from '../lib/startup.js'
-import {getTiDBProfile, parseMySqlDsn, readConfig, writeConfig} from '../lib/config.js'
+import {getTiDBProfile, parseMySqlDsn, readConfig, writeConfig, getFargateConfig, setFargateConfig} from '../lib/config.js'
 import blessed from 'blessed'
 import contrib from 'blessed-contrib'
 import {execFile, spawn} from 'node:child_process'
 import {promisify} from 'node:util'
 import {SageMakerRuntimeClient, InvokeEndpointCommand} from '@aws-sdk/client-sagemaker-runtime'
+
 
 const execFileAsync = promisify(execFile)
 
@@ -46,7 +47,7 @@ export default class AutoIR extends Command {
   ]
 
   static flags = {
-    'sagemaker-endpoint': Flags.string({description: 'SageMaker endpoint for embeddings', required: true}),
+    'sagemaker-endpoint': Flags.string({description: 'SageMaker endpoint for embeddings'}),
     'sagemaker-region': Flags.string({description: 'AWS region for SageMaker endpoint'}),
     region: Flags.string({char: 'r', description: 'AWS region (fallback for SageMaker)'}),
     table: Flags.string({description: 'TiDB table with logs', default: 'autoir_log_events'}),
@@ -65,6 +66,8 @@ export default class AutoIR extends Command {
 
   private state: AppState = AppState.INITIALIZING
   private dbPool?: mysql.Pool
+  private smEndpoint?: string
+  private smRegion?: string
 
   async run(): Promise<void> {
     const {flags} = await this.parse(AutoIR)
@@ -79,7 +82,9 @@ export default class AutoIR extends Command {
             break
             
           case AppState.DASHBOARD:
+            console.log('Transitioning to dashboard state...')
             await this.runDashboard(flags)
+            console.log('Dashboard completed, setting state to EXITING')
             this.state = AppState.EXITING
             break
             
@@ -136,27 +141,104 @@ export default class AutoIR extends Command {
       },
       {
         name: 'sagemaker_endpoint',
-        description: 'Validating SageMaker embedding endpoint',
-        run: async () => {
-          const region = flags['sagemaker-region'] || flags.region || process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION
-          const endpoint = flags['sagemaker-endpoint']
-          if (!region || !endpoint) throw new Error('Missing --sagemaker-endpoint or region')
+        description: 'Validating or creating SageMaker embedding endpoint',
+        run: async (updateStatus?: (message: string) => void) => {
+          updateStatus?.('Resolving AWS region...')
+          const region = await this.resolveAwsRegion(flags)
+          if (!region) throw new Error('AWS region not found. Provide --region or configure a default AWS region.')
+          updateStatus?.(`Using AWS region: ${region}`)
+
+          updateStatus?.('Resolving SageMaker endpoint...')
+          const savedEndpoint = (cfg as any)?.embed?.sagemakerEndpoint as string | undefined
+          const endpoint = flags['sagemaker-endpoint'] || savedEndpoint || (flags['auto-bootstrap'] ? 'autoir-embed-ep-srv' : undefined)
+          if (!endpoint) throw new Error('No SageMaker endpoint provided. Re-run with --sagemaker-endpoint or enable --auto-bootstrap to create one.')
+          updateStatus?.(`Using SageMaker endpoint: ${endpoint}`)
+
+          updateStatus?.('Checking endpoint status...')
+          let status = 'Unknown'
+          let actualEndpoint = endpoint
+
           try {
             const {stdout} = await execFileAsync('aws', ['sagemaker', 'describe-endpoint', '--endpoint-name', endpoint, '--region', region, '--output', 'json'])
             const data = JSON.parse(stdout)
-            const status = data?.EndpointStatus
-            if (status !== 'InService' && flags['auto-bootstrap']) {
-              // Attempt bootstrap via our own CLI command for consistency
-              await execFileAsync(process.execPath, ['./bin/run.js', 'aws', 'sagemaker-bootstrap', '--region', region, '--endpoint', endpoint])
-              return {endpoint, status: 'Bootstrapped'}
-            }
-            return {endpoint, status}
+            status = data?.EndpointStatus || 'Unknown'
+            updateStatus?.(`Endpoint status: ${status}`)
           } catch (e) {
-            if (flags['auto-bootstrap'] && region && endpoint) {
-              await execFileAsync(process.execPath, ['./bin/run.js', 'aws', 'sagemaker-bootstrap', '--region', region, '--endpoint', endpoint])
-              return {endpoint, status: 'Bootstrapped'}
+            status = 'NotFound'
+            updateStatus?.(`Endpoint '${endpoint}' not found, checking for alternatives...`)
+
+            // Look for any existing InService endpoint
+            try {
+              const {stdout} = await execFileAsync('aws', ['sagemaker', 'list-endpoints', '--region', region, '--output', 'json'])
+              const endpoints = JSON.parse(stdout)
+              const inServiceEndpoint = endpoints?.Endpoints?.find((ep: any) => ep.EndpointStatus === 'InService')
+
+              if (inServiceEndpoint) {
+                actualEndpoint = inServiceEndpoint.EndpointName
+                status = 'InService'
+                updateStatus?.(`Found existing InService endpoint: ${actualEndpoint}`)
+              } else {
+                updateStatus?.('No InService endpoints found')
+              }
+            } catch (listError) {
+              updateStatus?.('Could not list existing endpoints')
             }
-            throw e
+          }
+
+          if (status !== 'InService' && flags['auto-bootstrap']) {
+            updateStatus?.('Endpoint not ready, starting bootstrap process...')
+            await this.runSageMakerBootstrap(endpoint, region, updateStatus)
+            updateStatus?.('Bootstrap complete, verifying endpoint...')
+
+            // After bootstrap, wait/verify once
+            try {
+              const {stdout} = await execFileAsync('aws', ['sagemaker', 'describe-endpoint', '--endpoint-name', endpoint, '--region', region, '--output', 'json'])
+              const data = JSON.parse(stdout)
+              status = data?.EndpointStatus || 'Unknown'
+              updateStatus?.(`Final endpoint status: ${status}`)
+            } catch {
+              updateStatus?.('Could not verify endpoint status after bootstrap')
+            }
+          } else if (status === 'InService') {
+            updateStatus?.('Endpoint is ready and in service')
+          } else if (!flags['auto-bootstrap']) {
+            updateStatus?.('Auto-bootstrap disabled, skipping endpoint creation')
+          }
+
+          updateStatus?.('Saving endpoint configuration...')
+          // Persist resolved endpoint/region (use the actual working endpoint)
+          this.smEndpoint = actualEndpoint
+          this.smRegion = region
+          ;(cfg as any).embed = {
+            ...(cfg as any).embed,
+            provider: 'sagemaker',
+            sagemakerEndpoint: actualEndpoint,
+            sagemakerRegion: region,
+          }
+          await writeConfig(cfg)
+          updateStatus?.('Configuration saved successfully')
+
+          return {endpoint: actualEndpoint, status}
+        }
+      },
+      {
+        name: 'fargate_daemon',
+        description: 'Setting up Fargate daemon for log ingestion',
+        run: async (updateStatus?: (message: string) => void) => {
+          try {
+            const result = await this.onboardFargateDaemon(flags, updateStatus)
+
+            // Save configuration
+            await setFargateConfig({
+              cluster: result.cluster,
+              service: result.service,
+            })
+            updateStatus?.('Fargate configuration saved successfully')
+
+            return {cluster: result.cluster, service: result.service}
+          } catch (error: any) {
+            updateStatus?.(`Fargate setup skipped: ${error.message}`)
+            return {cluster: 'autoir', service: 'autoir'}
           }
         }
       },
@@ -178,7 +260,7 @@ export default class AutoIR extends Command {
           top: 'center', left: 'center', width: '70%', height: '40%',
           border: {type: 'line'}, label: ' Welcome to AutoIR ', tags: true,
           style: {fg: 'white', bg: 'black', border: {fg: 'cyan'}},
-          content: '{center}AutoIR will check your TiDB connection, AWS auth, and embedding endpoint.\\n\\nAfter setup, a combined dashboard with built-in semantic search will open.\\n\\nPress any key to continue.{/center}'
+          content: '{center}AutoIR will check your TiDB connection, AWS auth, and embedding endpoint.\n\nAfter setup, a combined dashboard with built-in semantic search will open.\\n\\nPress any key to continue.{/center}'
         })
         screen.render()
         await new Promise<void>(resolve => screen.once('keypress', () => resolve()))
@@ -195,394 +277,36 @@ export default class AutoIR extends Command {
   }
 
   private async runDashboard(flags: any): Promise<void> {
-    const screen = blessed.screen({ smartCSR: true, title: 'AutoIR - Dashboard & Search' })
+    const {ScreenManager} = await import('../lib/screen-manager.js')
+    const {SearchScreen} = await import('../screens/search.js')
+    const {MetricsScreen} = await import('../screens/metrics.js')
+    const {DaemonScreen} = await import('../screens/daemon.js')
+    const {LogsScreen} = await import('../screens/logs.js')
 
-    // Main container with two columns: left(search), right(metrics)
-    const container = blessed.box({ parent: screen, width: '100%', height: '100%', style: { bg: 'black' } })
-
-    const title = blessed.box({ parent: container, content: '{center}{bold}AutoIR — Dashboard + Search{/bold}{/center}', top: 0, height: 3, width: '100%', tags: true, style: { fg: 'cyan', bg: 'black' } })
-
-    // Left search panel
-    const searchPanel = blessed.box({ parent: container, top: 4, left: 0, width: '60%', height: '90%', style: { bg: 'black' } })
-    const searchLabel = blessed.box({ parent: searchPanel, top: 0, height: 1, width: '100%', content: ' Search (Enter to run) ', tags: true, style: { fg: 'yellow', bg: 'black' } })
-    const searchBox = blessed.textbox({ parent: searchPanel, top: 1, left: 0, width: '100%-2', height: 3, border: {type: 'line'}, inputOnFocus: true, style: {border: {fg: 'cyan'}} })
-    const resultsTable = contrib.table({ parent: searchPanel, top: 5, left: 0, width: '100%', height: '100%-7', label: 'Results', keys: true, fg: 'white', selectedFg: 'white', selectedBg: 'blue', columnWidth: [22, 14, 18, 60] })
-
-    // Right metrics/status panel
-    const statusPanel = blessed.box({ parent: container, top: 4, left: '60%', width: '40%', height: '90%', style: { bg: 'black' } })
-    const statusRow = blessed.box({ parent: statusPanel, top: 0, left: 0, width: '100%', height: 8, style: { bg: 'black' } })
-
-    // Service status card
-    const serviceStatusCard = blessed.box({
-      parent: statusRow,
-      left: 0,
-      width: '25%',
-      height: '100%',
-      border: {type: 'line'},
-      label: ' Service Status ',
-      style: {
-        fg: 'white',
-        bg: 'black',
-        border: {fg: 'green'}
-      },
-      tags: true,
-      content: '{center}Loading...{/center}'
-    })
-
-    // Tasks count card
-    const tasksCard = blessed.box({
-      parent: statusRow,
-      left: '25%',
-      width: '25%',
-      height: '100%',
-      border: {type: 'line'},
-      label: ' Tasks ',
-      style: {
-        fg: 'white',
-        bg: 'black',
-        border: {fg: 'blue'}
-      },
-      tags: true,
-      content: '{center}Loading...{/center}'
-    })
-
-    // CPU utilization card
-    const cpuCard = blessed.box({
-      parent: statusRow,
-      left: '50%',
-      width: '25%',
-      height: '100%',
-      border: {type: 'line'},
-      label: ' CPU Usage ',
-      style: {
-        fg: 'white',
-        bg: 'black',
-        border: {fg: 'yellow'}
-      },
-      tags: true,
-      content: '{center}Loading...{/center}'
-    })
-
-    // Memory utilization card
-    const memoryCard = blessed.box({
-      parent: statusRow,
-      left: '75%',
-      width: '25%',
-      height: '100%',
-      border: {type: 'line'},
-      label: ' Memory Usage ',
-      style: {
-        fg: 'white',
-        bg: 'black',
-        border: {fg: 'magenta'}
-      },
-      tags: true,
-      content: '{center}Loading...{/center}'
-    })
-
-    const chartsRow = blessed.box({ parent: statusPanel, top: 9, left: 0, width: '100%', height: 15, style: { bg: 'black' } })
-
-    // Task count line chart
-    const taskChart = contrib.line({
-      parent: chartsRow,
-      left: 0,
-      width: '50%',
-      height: '100%',
-      label: 'Task Count Over Time',
-      style: {
-        line: 'cyan',
-        text: 'white',
-        baseline: 'black'
-      },
-      xLabelPadding: 3,
-      xPadding: 5,
-      showLegend: true,
-      wholeNumbersOnly: true
-    })
-
-    // CPU/Memory line chart
-    const resourceChart = contrib.line({
-      parent: chartsRow,
-      left: '50%',
-      width: '50%',
-      height: '100%',
-      label: 'Resource Utilization',
-      style: {
-        line: 'yellow',
-        text: 'white',
-        baseline: 'black'
-      },
-      xLabelPadding: 3,
-      xPadding: 5,
-      showLegend: true,
-      wholeNumbersOnly: false
-    })
-
-    const tasksTable = contrib.table({ parent: statusPanel, top: 25, left: 0, width: '100%', height: '100%-26', label: 'Running Tasks', keys: true, fg: 'white', selectedFg: 'white', selectedBg: 'blue', columnSpacing: 2, columnWidth: [25, 15, 15, 12, 12, 15] })
-
-    const instructions = blessed.text({ parent: container, bottom: 0, height: 1, width: '100%', content: '{center}Enter: search • r: refresh metrics • d: daemon setup • q: quit{/center}', tags: true, style: { fg: 'yellow', bg: 'black' } })
-
-    // Data storage for charts
-    const taskCountHistory: Array<{x: string, y: number}> = []
-    const cpuHistory: Array<{x: string, y: number}> = []
-    const memoryHistory: Array<{x: string, y: number}> = []
-
-    // Fetch Fargate metrics
-    const fetchMetrics = async (): Promise<FargateMetrics | null> => {
-      try {
-        // Get service details
-        const serviceArgs = ['ecs', 'describe-services', '--cluster', flags.cluster, '--services', flags.service, '--output', 'json']
-        if (flags.region) serviceArgs.unshift('--region', flags.region)
-        
-        const {stdout: serviceOut} = await execFileAsync('aws', serviceArgs)
-        const serviceData = JSON.parse(serviceOut)
-        const service = serviceData.services?.[0]
-        
-        if (!service) return null
-
-        // Get task details
-        const taskArgs = ['ecs', 'list-tasks', '--cluster', flags.cluster, '--service-name', flags.service, '--output', 'json']
-        if (flags.region) taskArgs.unshift('--region', flags.region)
-        
-        const {stdout: tasksOut} = await execFileAsync('aws', taskArgs)
-        const tasksData = JSON.parse(tasksOut)
-        
-        let tasks: any[] = []
-        if (tasksData.taskArns?.length > 0) {
-          const describeArgs = ['ecs', 'describe-tasks', '--cluster', flags.cluster, '--tasks', ...tasksData.taskArns, '--output', 'json']
-          if (flags.region) describeArgs.unshift('--region', flags.region)
-          
-          const {stdout: describeOut} = await execFileAsync('aws', describeArgs)
-          const describeData = JSON.parse(describeOut)
-          tasks = describeData.tasks || []
-        }
-
-        return {
-          serviceName: service.serviceName,
-          clusterName: service.clusterArn?.split('/').pop() || flags.cluster,
-          runningCount: service.runningCount,
-          pendingCount: service.pendingCount,
-          desiredCount: service.desiredCount,
-          cpu: service.taskDefinition?.cpu || 0,
-          memory: service.taskDefinition?.memory || 0,
-          lastUpdated: new Date(service.updatedAt),
-          status: service.status,
-          tasks: tasks.map(task => ({
-            taskArn: task.taskArn?.split('/').pop() || '',
-            lastStatus: task.lastStatus,
-            healthStatus: task.healthStatus || 'UNKNOWN',
-            cpu: task.cpu || '0',
-            memory: task.memory || '0',
-            createdAt: new Date(task.createdAt)
-          }))
-        }
-      } catch (error) {
-        return null
-      }
+    const context = {
+      dbPool: this.dbPool,
+      smEndpoint: this.smEndpoint,
+      smRegion: this.smRegion,
+      flags,
+      state: this.state
     }
 
-    // Update display with metrics
-    const updateDisplay = (metrics: FargateMetrics | null) => {
-      const now = new Date().toLocaleTimeString()
+    const screenManager = new ScreenManager(context)
 
-      if (!metrics) {
-        serviceStatusCard.setContent('{center}{red-fg}Error loading service{/red-fg}{/center}')
-        tasksCard.setContent('{center}{red-fg}N/A{/red-fg}{/center}')
-        cpuCard.setContent('{center}{red-fg}N/A{/red-fg}{/center}')
-        memoryCard.setContent('{center}{red-fg}N/A{/red-fg}{/center}')
-        screen.render()
-        return
-      }
+    // Register all screens
+    screenManager.registerScreen(new SearchScreen())
+    screenManager.registerScreen(new MetricsScreen())
+    screenManager.registerScreen(new DaemonScreen())
+    screenManager.registerScreen(new LogsScreen())
 
-      // Update status cards
-      const statusColor = metrics.status === 'ACTIVE' ? 'green' : 'red'
-      serviceStatusCard.setContent(`{center}{${statusColor}-fg}${metrics.status}{/${statusColor}-fg}
-${metrics.serviceName}
-Cluster: ${metrics.clusterName}{/center}`)
+    // Start with menu screen
+    await screenManager.showMenuScreen()
 
-      tasksCard.setContent(`{center}{white-fg}Running: {green-fg}${metrics.runningCount}{/green-fg}
-Pending: {yellow-fg}${metrics.pendingCount}{/yellow-fg}
-Desired: {blue-fg}${metrics.desiredCount}{/blue-fg}{/white-fg}{/center}`)
-
-      const cpuPercent = Math.random() * 100 // In real implementation, get from CloudWatch
-      const memoryPercent = Math.random() * 100
-      
-      cpuCard.setContent(`{center}{white-fg}${cpuPercent.toFixed(1)}%
-${metrics.cpu} units allocated{/white-fg}{/center}`)
-
-      memoryCard.setContent(`{center}{white-fg}${memoryPercent.toFixed(1)}%
-${metrics.memory} MB allocated{/white-fg}{/center}`)
-
-      // Update chart data
-      taskCountHistory.push({x: now, y: metrics.runningCount})
-      cpuHistory.push({x: now, y: cpuPercent})
-      memoryHistory.push({x: now, y: memoryPercent})
-
-      // Keep only last 20 data points
-      if (taskCountHistory.length > 20) taskCountHistory.shift()
-      if (cpuHistory.length > 20) cpuHistory.shift()
-      if (memoryHistory.length > 20) memoryHistory.shift()
-
-      // Update charts
-      taskChart.setData([
-        {
-          title: 'Running Tasks',
-          x: taskCountHistory.map(d => d.x),
-          y: taskCountHistory.map(d => d.y),
-          style: {line: 'cyan'}
-        },
-        {
-          title: 'Desired Tasks',
-          x: taskCountHistory.map(d => d.x),
-          y: taskCountHistory.map(() => metrics.desiredCount),
-          style: {line: 'green'}
-        }
-      ])
-
-      resourceChart.setData([
-        {
-          title: 'CPU %',
-          x: cpuHistory.map(d => d.x),
-          y: cpuHistory.map(d => d.y),
-          style: {line: 'yellow'}
-        },
-        {
-          title: 'Memory %',
-          x: memoryHistory.map(d => d.x),
-          y: memoryHistory.map(d => d.y),
-          style: {line: 'magenta'}
-        }
-      ])
-
-      // Update tasks table
-      const tableData = [
-        ['Task ID', 'Status', 'Health', 'CPU', 'Memory', 'Created']
-      ]
-      
-      for (const task of metrics.tasks.slice(0, 10)) { // Show only first 10
-        tableData.push([
-          task.taskArn.slice(-8),
-          task.lastStatus,
-          task.healthStatus,
-          task.cpu,
-          task.memory + ' MB',
-          task.createdAt.toLocaleTimeString()
-        ])
-      }
-      
-      tasksTable.setData({
-        headers: tableData[0],
-        data: tableData.slice(1)
-      })
-      screen.render()
-    }
-
-    // Auto refresh
-    const refreshMetrics = async () => {
-      const metrics = await fetchMetrics()
-      updateDisplay(metrics)
-    }
-
-    // Initial loads
-    await refreshMetrics()
-
-    // Auto-refresh every 30 seconds
-    const refreshInterval = setInterval(refreshMetrics, 30000)
-
-    // Search behavior
-    const region = flags['sagemaker-region'] || flags.region || process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION
-    const endpoint = flags['sagemaker-endpoint']
-    const table = flags.table || 'autoir_log_events'
-    const runSearch = async (query: string) => {
-      if (!query || !this.dbPool) return
-      if (!endpoint || !region) {
-        resultsTable.setData({ headers: ['when','group','stream','message'], data: [['-', '-', '-', 'Missing embedding endpoint/region']] })
-        screen.render()
-        return
-      }
-      try {
-        const vec = await this.embedQuerySageMaker(query, endpoint, region)
-        const top = await this.searchByVector(this.dbPool, table, vec, undefined, undefined, 20, 32)
-        const rows = top.map(r => [new Date(r.ts_ms).toISOString(), String(r.log_group||''), String(r.log_stream||''), String(r.message||'').slice(0, 120)])
-        resultsTable.setData({ headers: ['when','group','stream','message'], data: rows })
-        screen.render()
-      } catch (e: any) {
-        resultsTable.setData({ headers: ['when','group','stream','message'], data: [['-', '-', '-', String(e?.message || e)]] })
-        screen.render()
-      }
-    }
-    searchBox.on('submit', async (val: string) => { await runSearch(val) })
-    searchBox.focus()
-
-    // Key bindings
-    screen.key(['r'], refreshMetrics)
-
-    screen.key(['d'], async () => {
-      const dlg = blessed.box({ parent: screen, top: 'center', left: 'center', width: '80%', height: '50%', border: {type: 'line'}, label: ' Daemon setup ', style: {fg: 'white', bg: 'black', border: {fg: 'cyan'}}, scrollable: true, keys: true, vi: true })
-      const lg = '/autoir/noise'
-      const regionStr = flags.region || process.env.AWS_REGION || ''
-      const localCmd = `./bin/run.js daemon --groups ${lg} --region ${regionStr} --sagemakerEndpoint ${endpoint} --sagemakerRegion ${region}`
-      const fargateCmd = `./bin/run.js aws autoir-fargate deploy --daemon-log-groups ${lg} --region ${regionStr} --sagemaker-endpoint ${endpoint} --sagemaker-region ${region}`
-      dlg.setContent(
-        'Press L to start local daemon now (background)\n' +
-        'Press F to deploy daemon to ECS Fargate now\n' +
-        '\nSuggested commands:\n' +
-        localCmd + '\n' +
-        fargateCmd + '\n\nPress Esc to close.'
-      )
-      screen.append(dlg); screen.render()
-      const onKey = async (ch: any, key: any) => {
-        if (key.name === 'escape') {
-          for (const k of ['l','L','f','F','escape']) screen.unkey(k, onKey)
-          dlg.destroy(); screen.render(); return }
-        if (key.name === 'l' || key.name === 'L') {
-          try { spawn(process.execPath, ['./bin/run.js','daemon','--groups', lg, '--region', regionStr, '--sagemakerEndpoint', endpoint!, '--sagemakerRegion', region!], {detached: true, stdio: 'ignore'}).unref() } catch {}
-          dlg.setContent(dlg.getContent() + '\nStarted local daemon in background.')
-          screen.render()
-        }
-        if (key.name === 'f' || key.name === 'F') {
-          try {
-            spawn(process.execPath, ['./bin/run.js','aws','autoir-fargate','deploy','--daemon-log-groups', lg, '--region', regionStr, '--sagemaker-endpoint', endpoint!, '--sagemaker-region', region!], {detached: true, stdio: 'ignore'}).unref()
-          } catch {}
-          dlg.setContent(dlg.getContent() + '\nRequested Fargate deployment in background (check CloudFormation).')
-          screen.render()
-        }
-      }
-      screen.key(['l','L','f','F','escape'], onKey)
-    })
-
-    screen.key(['l'], async () => {
-      // Would open logs viewer
-      // For now, just show a message
-      const modal = blessed.message({
-        parent: screen,
-        top: 'center',
-        left: 'center',
-        width: '50%',
-        height: '30%',
-        border: {type: 'line'},
-        style: {fg: 'white', bg: 'black', border: {fg: 'blue'}}
-      })
-      modal.display('Logs viewer not implemented yet. Press any key to continue.', () => {
-        screen.render()
-      })
-    })
-
-    screen.key(['q', 'C-c'], () => {
-      clearInterval(refreshInterval)
-      screen.destroy()
-      this.state = AppState.EXITING
-    })
-
-    // Focus and render
-    screen.render()
-
-    // Keep the dashboard running until exit
+    // Keep running until exit
     return new Promise((resolve) => {
       const checkState = () => {
         if (this.state !== AppState.DASHBOARD) {
-          clearInterval(refreshInterval)
-          screen.destroy()
+          screenManager.cleanup()
           resolve()
         } else {
           setTimeout(checkState, 100)
@@ -616,6 +340,276 @@ ${metrics.memory} MB allocated{/white-fg}{/center}`)
     if (this.dbPool) {
       await this.dbPool.end()
     }
+  }
+
+  private async promptUserModal(screen: blessed.Widgets.Screen, question: string, defaultValue?: string): Promise<string> {
+    return new Promise((resolve) => {
+      const modal = blessed.box({
+        parent: screen,
+        top: 'center',
+        left: 'center',
+        width: '60%',
+        height: 8,
+        border: {type: 'line'},
+        style: {fg: 'white', bg: 'black', border: {fg: 'cyan'}},
+        label: ' User Input ',
+        tags: true
+      })
+
+      const questionText = blessed.text({
+        parent: modal,
+        top: 1,
+        left: 2,
+        width: '100%-4',
+        content: question,
+        tags: true,
+        style: {fg: 'yellow'}
+      })
+
+      const input = blessed.textbox({
+        parent: modal,
+        top: 3,
+        left: 2,
+        width: '100%-4',
+        height: 1,
+        border: {type: 'line'},
+        style: {border: {fg: 'green'}},
+        inputOnFocus: true
+      })
+
+      const instructions = blessed.text({
+        parent: modal,
+        bottom: 1,
+        left: 2,
+        width: '100%-4',
+        content: `Default: ${defaultValue || 'none'} | Press Enter to confirm, Escape to use default`,
+        style: {fg: 'gray'},
+        tags: true
+      })
+
+      if (defaultValue) {
+        input.setValue(defaultValue)
+      }
+
+      screen.append(modal)
+      input.focus()
+      screen.render()
+
+      const cleanup = () => {
+        modal.destroy()
+        screen.render()
+      }
+
+      input.on('submit', (value: string) => {
+        cleanup()
+        resolve(value.trim() || defaultValue || '')
+      })
+
+      input.key('escape', () => {
+        cleanup()
+        resolve(defaultValue || '')
+      })
+
+      screen.key('escape', () => {
+        cleanup()
+        resolve(defaultValue || '')
+      })
+    })
+  }
+
+  private async onboardSageMakerEndpoint(updateStatus?: (message: string) => void): Promise<{endpoint: string, region: string}> {
+    updateStatus?.('Setting up SageMaker embedding endpoint...')
+
+    // Get current config
+    const cfg = await readConfig()
+
+    // Determine region
+    let region = process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || (cfg as any)?.embed?.sagemakerRegion
+    if (!region) {
+      try {
+        const {stdout} = await execFileAsync('aws', ['configure', 'get', 'region'])
+        region = stdout?.toString?.().trim()
+      } catch {}
+    }
+
+    if (!region) {
+      region = 'us-east-1' // Default fallback
+    }
+
+    updateStatus?.(`Using AWS region: ${region}`)
+
+    // Check for existing endpoint
+    const savedEndpoint = (cfg as any)?.embed?.sagemakerEndpoint
+    let endpoint = savedEndpoint || 'autoir-embed-ep' // Use default if none saved
+
+    updateStatus?.(`Using SageMaker endpoint: ${endpoint}`)
+
+    // Check if endpoint exists
+    let status = 'Unknown'
+    try {
+      const {stdout} = await execFileAsync('aws', ['sagemaker', 'describe-endpoint', '--endpoint-name', endpoint, '--region', region, '--output', 'json'])
+      const data = JSON.parse(stdout)
+      status = data?.EndpointStatus || 'Unknown'
+      updateStatus?.(`Endpoint status: ${status}`)
+    } catch (e) {
+      status = 'NotFound'
+      updateStatus?.('Endpoint not found')
+
+      // Look for any existing InService endpoint
+      try {
+        const {stdout} = await execFileAsync('aws', ['sagemaker', 'list-endpoints', '--region', region, '--output', 'json'])
+        const endpoints = JSON.parse(stdout)
+        const inServiceEndpoint = endpoints?.Endpoints?.find((ep: any) => ep.EndpointStatus === 'InService')
+
+        if (inServiceEndpoint) {
+          endpoint = inServiceEndpoint.EndpointName
+          status = 'InService'
+          updateStatus?.(`Found existing InService endpoint: ${endpoint}`)
+        }
+      } catch (listError) {
+        updateStatus?.('Could not list existing endpoints')
+      }
+    }
+
+    // Bootstrap if needed
+    if (status !== 'InService') {
+      updateStatus?.('🚀 Starting SageMaker endpoint bootstrap...')
+      updateStatus?.('This may take 10-20 minutes...')
+
+      await this.runSageMakerBootstrap(endpoint, region, (msg: string) => {
+        updateStatus?.(`Bootstrap: ${msg}`)
+      })
+
+      updateStatus?.('✅ SageMaker endpoint ready!')
+    } else {
+      updateStatus?.('✅ SageMaker endpoint already ready!')
+    }
+
+    return {endpoint, region}
+  }
+
+  private async onboardFargateDaemon(flags: any, updateStatus?: (message: string) => void): Promise<{cluster: string, service: string}> {
+    updateStatus?.('Setting up Fargate daemon for log ingestion...')
+
+    // Get current config
+    const fargateCfg = await getFargateConfig()
+
+    // Determine cluster and service names
+    let cluster = flags.cluster || fargateCfg?.cluster || 'autoir'
+    let service = flags.service || fargateCfg?.service || 'autoir'
+
+    updateStatus?.(`Using ECS cluster: ${cluster}`)
+    updateStatus?.(`Using ECS service: ${service}`)
+
+    // Check if service exists
+    try {
+      const {stdout} = await execFileAsync('aws', ['ecs', 'describe-services', '--cluster', cluster, '--services', service, '--output', 'json'])
+      const data = JSON.parse(stdout)
+      const svc = data.services?.[0]
+
+      if (svc) {
+        updateStatus?.(`Fargate daemon status: ${svc.status}`)
+        if (svc.status === 'ACTIVE') {
+          updateStatus?.('✅ Fargate daemon is already running!')
+          return {cluster, service}
+        }
+      }
+    } catch (e) {
+      updateStatus?.('Fargate daemon not found - will show deployment option in dashboard')
+    }
+
+    // Skip deployment during startup - show option in dashboard instead
+    updateStatus?.('Fargate daemon setup available in dashboard (press "d" key)')
+    return {cluster, service}
+  }
+
+  private async runSageMakerBootstrap(endpoint: string, region: string, updateStatus?: (message: string) => void): Promise<void> {
+    updateStatus?.('Starting SageMaker bootstrap process...')
+
+    return new Promise((resolve, reject) => {
+      const bootstrapProcess = spawn(process.execPath, ['./bin/run.js', 'aws', 'sagemaker-bootstrap', '--region', region, '--endpoint', endpoint], {
+        stdio: ['inherit', 'pipe', 'pipe']
+      })
+
+      let outputBuffer = ''
+      let errorBuffer = ''
+
+      const updateOutput = () => {
+        const lines = outputBuffer.split('\n').filter(line => line.trim())
+        if (lines.length > 0) {
+          const lastLine = lines[lines.length - 1]
+          updateStatus?.(`Bootstrap: ${lastLine}`)
+        }
+      }
+
+      bootstrapProcess.stdout?.on('data', (data) => {
+        const output = data.toString()
+        outputBuffer += output
+        updateOutput()
+      })
+
+      bootstrapProcess.stderr?.on('data', (data) => {
+        const error = data.toString()
+        errorBuffer += error
+        // Show errors as well
+        const lines = error.split('\n').filter((line: string) => line.trim())
+        if (lines.length > 0) {
+          updateStatus?.(`Bootstrap error: ${lines[lines.length - 1]}`)
+        }
+      })
+
+      bootstrapProcess.on('close', (code) => {
+        if (code === 0) {
+          updateStatus?.('Bootstrap completed successfully')
+          resolve()
+        } else {
+          const error = new Error(`Bootstrap failed with exit code ${code}. Error: ${errorBuffer}`)
+          updateStatus?.(`Bootstrap failed: ${error.message}`)
+          reject(error)
+        }
+      })
+
+      bootstrapProcess.on('error', (error) => {
+        updateStatus?.(`Bootstrap process error: ${error.message}`)
+        reject(error)
+      })
+
+      // Update status periodically to show we're still working
+      const progressInterval = setInterval(() => {
+        updateOutput()
+      }, 1000)
+
+      // Clear interval when process ends
+      bootstrapProcess.on('close', () => clearInterval(progressInterval))
+      bootstrapProcess.on('error', () => clearInterval(progressInterval))
+    })
+  }
+
+  private async resolveAwsRegion(flags: any): Promise<string | undefined> {
+    const fromFlags = flags['sagemaker-region'] || flags.region
+    if (fromFlags) return fromFlags
+    const fromEnv = process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION
+    if (fromEnv) return fromEnv
+    const fromCfg = (await readConfig())?.embed?.sagemakerRegion
+    if (fromCfg) return fromCfg
+    // Fallback to AWS CLI configured region
+    try {
+      const {stdout} = await execFileAsync('aws', ['configure', 'get', 'region'])
+      const r = stdout?.toString?.().trim()
+      if (r) return r
+    } catch {}
+    try {
+      const {stdout} = await execFileAsync('aws', ['configure', 'get', 'default.region'])
+      const r = stdout?.toString?.().trim()
+      if (r) return r
+    } catch {}
+    try {
+      const {stdout} = await execFileAsync('aws', ['configure', 'list'])
+      const line = stdout.split('\n').find(l => /region\s+\*/.test(l) || /^\s*region\s+/.test(l))
+      const m = line ? /region\s+\*?\s+(\S+)/.exec(line) : undefined
+      if (m && m[1] && m[1] !== 'None') return m[1]
+    } catch {}
+    return undefined
   }
 
   private async embedQuerySageMaker(query: string, endpoint: string, region?: string): Promise<number[]> {

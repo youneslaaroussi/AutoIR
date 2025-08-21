@@ -4,7 +4,7 @@ import {RotatingSphere} from './animation.js'
 export interface StartupProcess {
   name: string
   description: string
-  run: () => Promise<any>
+  run: (updateStatus?: (message: string) => void) => Promise<any>
 }
 
 export interface StartupConfig {
@@ -145,7 +145,9 @@ export class StartupScreen {
         this.updateStatus(`[${i + 1}/${this.config.processes.length}] ${process.description}...`)
         
         try {
-          const result = await process.run()
+          const result = await process.run((message: string) => {
+            this.updateStatus(`[${i + 1}/${this.config.processes.length}] ${process.description}... ${message}`)
+          })
           results.push({name: process.name, success: true, result})
           this.updateStatus(`[${i + 1}/${this.config.processes.length}] ${process.description}... DONE`)
         } catch (error: any) {
