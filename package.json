@@ -49,7 +49,8 @@
     "node": ">=18.0.0"
   },
   "files": [
-    "./bin",
+    "./bin/run.js",
+    "./bin/run.cmd",
     "./dist",
     "./oclif.manifest.json"
   ],

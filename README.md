@@ -100,16 +100,13 @@ git clone https://github.com/youneslaaroussi/autoir.git
 cd autoir
 
 # Install dependencies
-pnpm install
+npm install
 
 # Build the project
-pnpm run build
-
-# Run in development mode
-pnpm run dev
+npm run build
 
 # Run tests
-pnpm test
+npm test
 ```
 
 ## License
