@@ -1,6 +1,5 @@
 import {BaseTool} from './base-tool.js'
-import mysql from 'mysql2/promise'
-import {getTiDBProfile} from '../config.js'
+import {getDatabase} from '../db-factory.js'
 
 export class TiDBQueryTool extends BaseTool {
   readonly name = 'tidb_query'
@@ -29,27 +28,21 @@ export class TiDBQueryTool extends BaseTool {
     const hasLimit = /\blimit\b/i.test(sql)
     const finalSql = hasLimit ? sql : `${sql} LIMIT ${limit}`
 
-    const profile = await getTiDBProfile('default')
-    if (!profile) throw new Error('TiDB profile not configured. Run main app to set it.')
-
-    const pool = mysql.createPool({
-      host: profile.host,
-      port: profile.port ?? 4000,
-      user: profile.user,
-      password: profile.password,
-      database: profile.database,
-      waitForConnections: true,
-      connectionLimit: 2,
-      ...( /tidbcloud\.com$/i.test(profile.host) ? {ssl: {minVersion: 'TLSv1.2', rejectUnauthorized: true}} : {}),
-    })
-
     try {
-      const [rows] = await pool.query(finalSql)
-      const json = JSON.stringify(rows)
+      const db = await getDatabase()
+      const rows = await db.query(finalSql)
       const score = Array.isArray(rows) ? rows.length : 0
-      return JSON.stringify({rows: JSON.parse(json), score, meta: {limit, appliedLimit: !hasLimit}})
-    } finally {
-      await pool.end()
+      
+      // Add demo indicator if using mock
+      const meta = {
+        limit, 
+        appliedLimit: !hasLimit,
+        ...(db.isUsingMockDatabase() ? {demo_mode: true, mock_data: true} : {})
+      }
+      
+      return JSON.stringify({rows, score, meta})
+    } catch (error) {
+      throw new Error(`TiDB query failed: ${error}`)
     }
   }
 }

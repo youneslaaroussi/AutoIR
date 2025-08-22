@@ -1,8 +1,7 @@
 import {Args, Command, Flags} from '@oclif/core'
-import mysql from 'mysql2/promise'
 import chalk from 'chalk'
-import {SageMakerRuntimeClient, InvokeEndpointCommand} from '@aws-sdk/client-sagemaker-runtime'
-import {getTiDBProfile, parseMySqlDsn} from '../../lib/config.js'
+import {getDatabase} from '../../lib/db-factory.js'
+import {getMockSageMaker} from '../../lib/mock-aws.js'
 
 type Row = {
   id: string
@@ -51,132 +50,93 @@ export default class LogsQuery extends Command {
     const {args, flags} = await this.parse(LogsQuery)
     const queryText = args.query
 
-    // Connect TiDB via DSN, saved profile, or flags
-    const conn = await this.resolveTiDBConn(flags)
-    const pool = mysql.createPool({
-      host: conn.host,
-      port: conn.port ?? 4000,
-      user: conn.user,
-      password: conn.password,
-      database: conn.database,
-      waitForConnections: true,
-      connectionLimit: 5,
-      ...( /tidbcloud\.com$/i.test(conn.host) ? {ssl: {minVersion: 'TLSv1.2', rejectUnauthorized: true}} : {}),
-    })
+    // Use database factory (will use mock for demo)
+    const db = await getDatabase()
+    
+    // Use mock SageMaker for embeddings
+    const sagemaker = await getMockSageMaker(flags['sagemaker-endpoint']!)
+    
+    if (flags.debug) {
+      this.log(chalk.gray(`Using ${db.isUsingMockDatabase() ? 'mock' : 'real'} database for demo`))
+    }
 
-    // Embed the query via SageMaker
-    const qVec = await this.embedQuerySageMaker(queryText, flags['sagemaker-endpoint']!, flags['sagemaker-region'] || flags.region)
+    // Generate embedding for the query
+    const qVec = await sagemaker.invokeEndpoint(queryText)
     if (!qVec.length) {
-      this.error('Failed to generate embedding for the query. Ensure the SageMaker endpoint is healthy and returns vectors.')
+      this.error('Failed to generate embedding for the query.')
       return
     }
 
-    // Server-side vector search using TiDB VECTOR and cosine distance
-    const top = await this.searchByVector(
-      pool,
-      flags.table!,
-      qVec,
-      flags.group,
-      flags.since,
-      flags.limit!,
-      flags['min-len']!,
-    )
+    // Build vector search SQL
+    const vectorSql = this.buildVectorSearchSql(flags.table!, qVec, flags.group, flags.since, flags.limit!, flags['min-len']!)
+    
+    // Execute search
+    const results = await db.query(vectorSql)
 
     if (flags.json) {
-      this.log(JSON.stringify(top, null, 2))
+      this.log(JSON.stringify(results, null, 2))
     } else {
-      for (const r of top) {
+      for (const r of results) {
         const when = new Date(r.ts_ms).toISOString()
-        const score = (1 - (r as any).distance)
+        const score = (1 - (r.distance || 0))
         this.log(`${chalk.bold(score.toFixed(6))}  ${when}  ${chalk.gray(r.log_group)}  ${chalk.gray(r.log_stream)}\n${r.message}\n`)
       }
-      if (top.length === 0) this.log(chalk.yellow('No results'))
-    }
-
-    await pool.end()
-  }
-
-  private async resolveTiDBConn(flags: any): Promise<{host: string; port?: number; user: string; password?: string; database: string}> {
-    const saved = await getTiDBProfile('default')
-    const viaDsn = flags.dsn ? parseMySqlDsn(flags.dsn) : (process.env.TIDB_DSN ? parseMySqlDsn(process.env.TIDB_DSN) : undefined)
-    const viaFlags = (flags['tidb-host'] && flags['tidb-user'] && flags['tidb-database']) ? {
-      host: flags['tidb-host'],
-      port: flags['tidb-port'],
-      user: flags['tidb-user'],
-      password: flags['tidb-password'],
-      database: flags['tidb-database'],
-    } : undefined
-    const conn = saved ?? viaDsn ?? viaFlags
-    if (!conn) this.error('Missing TiDB connection. Provide --dsn or host/user/database flags, or save a profile.')
-    return conn as any
-  }
-
-  private async searchByVector(
-    pool: mysql.Pool,
-    table: string,
-    qVec: number[],
-    group: string | undefined,
-    since: string | undefined,
-    limit: number,
-    minLen: number,
-  ): Promise<Array<Row & {distance: number}>> {
-    const where: string[] = ['CHAR_LENGTH(message) >= ?']
-    const params: any[] = [JSON.stringify(qVec), minLen]
-    if (group) { where.push('log_group = ?'); params.push(group) }
-    if (since) {
-      const cutoff = this.parseSince(since)
-      if (cutoff) { where.push('ts_ms >= ?'); params.push(cutoff) }
-    }
-    const sql = `
-      SELECT id, log_group, log_stream, ts_ms, message,
-             vec_cosine_distance(embedding, CAST(? AS VECTOR(384))) AS distance
-      FROM \`${table}\`
-      ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
-      ORDER BY distance ASC
-      LIMIT ?
-    `
-    params.push(limit)
-    const [rows] = await pool.query(sql, params)
-    return rows as Array<Row & {distance: number}>
-  }
-
-  private parseSince(s: string): number | undefined {
-    const now = Date.now()
-    const m = /^([0-9]+)\s*(m|h|d)$/i.exec(s.trim())
-    if (!m) return undefined
-    const n = parseInt(m[1], 10)
-    const unit = m[2].toLowerCase()
-    const ms = unit === 'm' ? n * 60_000 : unit === 'h' ? n * 3_600_000 : n * 86_400_000
-    return now - ms
-  }
-
-  // Removed client-side JSON embedding scoring; using TiDB VECTOR + vec_cosine_distance
-
-  private async embedQuerySageMaker(text: string, endpointName: string, region?: string): Promise<number[]> {
-    const client = new SageMakerRuntimeClient({region: region || process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION})
-    const body = JSON.stringify({inputs: text})
-    const cmd = new InvokeEndpointCommand({
-      EndpointName: endpointName,
-      ContentType: 'application/json',
-      Accept: 'application/json',
-      Body: Buffer.from(body),
-    })
-    const resp = await client.send(cmd)
-    const payloadStr = new TextDecoder().decode(resp.Body as any)
-    const payload = JSON.parse(payloadStr)
-    
-    // Structure: [batch][tokens][384_dims] for single query
-    const tokens = payload[0] as number[][]
-    const dims = tokens[0]?.length || 0
-    if (!dims) return []
-    const sums = new Array(dims).fill(0)
-    for (const token of tokens) {
-      for (let i = 0; i < dims; i++) {
-        sums[i] += token[i]
+      if (results.length === 0) {
+        this.log(chalk.yellow('No results'))
+      } else {
+        this.log()
+        this.log(chalk.green(`✅ Found ${results.length} similar log entries`))
+        if (db.isUsingMockDatabase()) {
+          this.log(chalk.cyan('🎯 Demo mode: Results generated from realistic mock data'))
+        }
       }
     }
-    return sums.map(v => v / tokens.length)
   }
+
+  private buildVectorSearchSql(table: string, qVec: number[], group?: string, since?: string, limit = 20, minLen = 32): string {
+    const vectorStr = JSON.stringify(qVec)
+    
+    let sql = `
+      SELECT id, log_group, log_stream, ts_ms, message,
+             1 - (embedding <=> CAST('${vectorStr}' AS VECTOR(384))) AS score,
+             (embedding <=> CAST('${vectorStr}' AS VECTOR(384))) AS distance
+      FROM ${table}
+      WHERE LENGTH(message) >= ${minLen}
+    `
+    
+    if (group) {
+      sql += ` AND log_group = '${group}'`
+    }
+    
+    if (since) {
+      const sinceMs = this.parseSinceToMs(since)
+      if (sinceMs > 0) {
+        sql += ` AND ts_ms >= ${sinceMs}`
+      }
+    }
+    
+    sql += ` ORDER BY distance ASC LIMIT ${limit}`
+    
+    return sql
+  }
+
+  private parseSinceToMs(since: string): number {
+    const now = Date.now()
+    const match = since.match(/^(\d+)([hd])$/)
+    if (!match) return 0
+    
+    const [, num, unit] = match
+    const value = parseInt(num, 10)
+    
+    if (unit === 'h') {
+      return now - (value * 60 * 60 * 1000)
+    } else if (unit === 'd') {
+      return now - (value * 24 * 60 * 60 * 1000)
+    }
+    
+    return 0
+  }
+
 }
 
 
