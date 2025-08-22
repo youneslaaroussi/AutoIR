@@ -1,0 +1,44 @@
+# Development files
+src/
+test/
+diagrams/
+ca.cer
+*.tgz
+
+# Configuration files
+.eslintrc*
+.prettierrc*
+tsconfig*.json
+pnpm-workspace.yaml
+pnpm-lock.yaml
+
+# Development scripts
+bin/dev.*
+
+# Logs and temporary files
+*-debug.log
+*-error.log
+*.log
+tmp/
+.DS_Store
+.idea/
+
+# Git files
+.git/
+.gitignore
+
+# Test coverage
+coverage/
+.nyc_output/
+
+# Environment files
+.env*
+
+# Editor files
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS generated files
+Thumbs.db

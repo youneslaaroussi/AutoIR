@@ -1,5 +1,0 @@
-onlyBuiltDependencies:
-  - canvas
-  - isolated-vm
-  - unrs-resolver
-  - yarn
