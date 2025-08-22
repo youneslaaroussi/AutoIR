@@ -10,8 +10,10 @@ export class DatabaseConnection {
   private isUsingMock: boolean = false
 
   async initialize(forceReal = false): Promise<void> {
-    // Always use mock for demo unless explicitly forced to use real
-    if (!forceReal) {
+    // Check if we should force demo mode
+    const demoMode = process.env.DEMO_MODE === 'true' || !forceReal
+    
+    if (demoMode) {
       this.isUsingMock = true
       if (!mockDb) {
         mockDb = new MockTiDB()

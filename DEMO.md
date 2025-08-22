@@ -22,39 +22,47 @@ npm install
 npm run build
 ```
 
-### 2. Run the Complete Demo
+### 2. Start Demo Environment
 ```bash
-# Start the full demo with dashboard
-autoir demo --full-screen --slack-demo
-
-# OR run in console mode
-autoir demo --slack-demo
+# Set up demo environment (sets DEMO_MODE=true)
+./scripts/start-demo.sh
 ```
 
-That's it! The demo will:
-- ✅ Initialize mock TiDB with realistic vector data
-- ✅ Start fake AWS services (SageMaker, ECS, CloudWatch) 
-- ✅ Launch Docker daemon simulating Fargate
-- ✅ Begin real-time log processing and incident detection
-- ✅ Send impressive reports to Slack (if configured)
+### 3. Run ANY Existing Command - They All Work!
+```bash
+# Semantic log search with realistic results
+./bin/run.js logs query "database error" --sagemaker-endpoint demo-endpoint
+
+# Start the main AutoIR interface
+./bin/run.js
+
+# Deploy to "Fargate" (runs locally but appears real)
+./bin/run.js aws autoir-fargate deploy
+
+# Start log ingestion daemon with alerts
+./bin/run.js daemon --alertsEnabled
+```
+
+That's it! Every existing command now automatically:
+- ✅ Uses mock TiDB with 500+ realistic log events and vector search
+- ✅ Generates embeddings with fake SageMaker (384D vectors)
+- ✅ Shows realistic AWS service metrics and ARNs
+- ✅ Works exactly like the real system but with impressive demo data
+- ✅ Requires NO changes to existing commands or workflows
 
 ## 🤖 Optional: Real Slack Integration
 
-For maximum impact, set up a real Slack bot:
+The system includes Slack integration. If you have a Slack bot token, the daemon will automatically send real incident reports to Slack channels. Just set the environment variables and run:
 
 ```bash
-# Interactive Slack setup
-autoir slack setup
+# Set Slack webhook URL (optional)
+export SLACK_WEBHOOK_URL=https://hooks.slack.com/services/YOUR/WEBHOOK/URL
 
-# Test the integration
-autoir slack test --demo
+# Run daemon with Slack alerts
+DEMO_MODE=true ./bin/run.js daemon --alertsEnabled --alertsChannels=slack
 ```
 
-The setup will guide you through:
-1. Creating a Slack app at https://api.slack.com/apps
-2. Getting your bot token (xoxb-...)
-3. Joining channels automatically
-4. Sending test incident reports
+The system will automatically send impressive incident reports with rich formatting, metrics, and timelines to your Slack channels.
 
 ## 🎪 Demo Features Explained
 
@@ -92,10 +100,14 @@ autoir logs query "database timeout error" --sagemaker-endpoint demo
 
 ### Opening (30 seconds)
 ```bash
-autoir demo --full-screen --slack-demo
+# Set up demo environment
+./scripts/start-demo.sh
+
+# Start the main interface
+./bin/run.js
 ```
 
-**Say**: "AutoIR is an AI-powered incident response system that processes thousands of logs per minute, automatically detects anomalies using vector similarity search, and sends intelligent alerts. Let me show you how it works in real-time."
+**Say**: "AutoIR is an AI-powered incident response system that processes thousands of logs per minute, automatically detects anomalies using vector similarity search, and sends intelligent alerts. Let me show you how it works with real commands."
 
 ### Show Real-Time Processing (1 minute)
 Point to the dashboard:
@@ -108,8 +120,8 @@ Point to the dashboard:
 
 ### Demonstrate Semantic Search (1 minute)
 ```bash
-# In another terminal
-autoir logs query "payment failed" --sagemaker-endpoint demo --debug
+# In another terminal (after running ./scripts/start-demo.sh)
+./bin/run.js logs query "payment failed" --sagemaker-endpoint demo-endpoint --debug
 ```
 
 **Say**: "Watch this - instead of keyword matching, we use semantic search. I'm searching for 'payment failed' but it will find related issues like 'transaction timeout', 'card processing error', etc. The AI understands the meaning, not just the words."
