@@ -37,6 +37,15 @@ export type AppConfig = {
     cluster?: string
     service?: string
   }
+  slack?: {
+    botToken?: string
+    channelId?: string
+    channelName?: string
+    lastTestMessageTs?: string
+  }
+  demo?: {
+    enabled?: boolean
+  }
 }
 
 const CONFIG_DIR = path.join(os.homedir(), '.autoir')
@@ -126,6 +135,31 @@ export async function setFargateConfig(fargate: NonNullable<AppConfig['fargate']
   const cfg = await readConfig()
   cfg.fargate = fargate
   await writeConfig(cfg)
+}
+
+export type SlackConfig = NonNullable<AppConfig['slack']>
+
+export async function getSlackConfig(): Promise<SlackConfig | undefined> {
+  const cfg = await readConfig()
+  if (!cfg.slack) return undefined
+  return cfg.slack
+}
+
+export async function setSlackConfig(slack: SlackConfig): Promise<void> {
+  const cfg = await readConfig()
+  cfg.slack = slack
+  await writeConfig(cfg)
+}
+
+export async function setDemoEnabled(enabled: boolean): Promise<void> {
+  const cfg = await readConfig()
+  cfg.demo = { ...(cfg.demo || {}), enabled }
+  await writeConfig(cfg)
+}
+
+export async function isDemoEnabled(): Promise<boolean> {
+  const cfg = await readConfig()
+  return !!cfg.demo?.enabled
 }
 
 

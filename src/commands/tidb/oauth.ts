@@ -62,6 +62,7 @@ export default class TiDBOauth extends Command {
         if (flags.wait) this.log(`[dry-run] ${execPath} auth whoami (poll)`) 
       } else {
         this.log('[dry-run] require ticloud to complete OAuth programmatically')
+        this.log('[dry-run] open https://tidbcloud.com/console/login')
       }
       return
     }
