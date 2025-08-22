@@ -1,7 +1,7 @@
 import {Command, Flags} from '@oclif/core'
 import {spawn} from 'node:child_process'
 import mysql from 'mysql2/promise'
-import {parseMySqlDsn, setLlmConfig, isDemoEnabled, getSlackConfig} from '../lib/config.js'
+import {parseMySqlDsn, setLlmConfig, isDemoEnabled, getSlackConfig, setSlackConfig} from '../lib/config.js'
 import {ensureAutoIrTables, getCursor, setCursor, upsertIncidentByDedupe} from '../lib/db.js'
 import {ToolManager} from '../lib/tools/index.js'
 import {LlmClient, LlmMessage} from '../lib/llm/client.js'
@@ -9,7 +9,9 @@ import crypto from 'node:crypto'
 import {SNSClient, PublishCommand} from '@aws-sdk/client-sns'
 import {execFile} from 'node:child_process'
 import {promisify} from 'node:util'
-import {sendSlackBotMessage} from '../lib/slack.js'
+import {sendSlackBotMessage, lookupChannelId, validateSlackBot} from '../lib/slack.js'
+import inquirer from 'inquirer'
+import ora from 'ora'
 
 const execFileAsync = promisify(execFile)
 
@@ -33,9 +35,6 @@ export default class Daemon extends Command {
 		alertsMaxEvents: Flags.integer({description: 'Max events to scan per tick', default: 1000}),
 		alertsMaxSamplesPerIssue: Flags.integer({description: 'Max sample messages per detected issue', default: 5}),
 		table: Flags.string({description: 'TiDB table with logs', default: 'autoir_log_events'}),
-		// Demo mode
-		demo: Flags.boolean({description: 'Run in demo mode with synthetic data and WOW reports', default: false}),
-		demoMajorReportEvery: Flags.integer({description: 'Demo mode: send a major WOW report every N ticks', default: 3}),
 	}
 
 	async run(): Promise<void> {
@@ -45,18 +44,7 @@ export default class Daemon extends Command {
 		const smEndpoint = flags.sagemakerEndpoint || process.env.SAGEMAKER_ENDPOINT
 		const smRegion = flags.sagemakerRegion || process.env.SAGEMAKER_REGION || region
 
-		const demo = !!(flags.demo || /^true$/i.test(process.env.DEMO_MODE || '') || await isDemoEnabled())
-
-		if (!demo) {
-			if (!groups.length) {
-				this.log('No log groups provided. Set --groups or LOG_GROUPS env. Exiting.')
-				return
-			}
-			if (!smEndpoint) {
-				this.log('No SAGEMAKER_ENDPOINT provided. Set flag or env. Exiting.')
-				return
-			}
-		}
+		const demo = !!(await isDemoEnabled() || process.env.AUTOIR_DEMO === '1' || !groups.length || !smEndpoint)
 
 		const children: ReturnType<typeof spawn>[] = []
 
@@ -79,7 +67,7 @@ export default class Daemon extends Command {
 				children.push(tail, worker)
 			}
 		} else {
-			this.log('[demo] Running in demo mode: simulating CloudWatch ingestion and alerts')
+			this.log('Starting local ingestion simulation...')
 		}
 
 		process.on('SIGINT', () => {
@@ -87,10 +75,10 @@ export default class Daemon extends Command {
 			process.exit(0)
 		})
 
-		// Start alerting loop if enabled (or always in demo)
+		// Start alerting loop if enabled (auto-on in demo)
 		const alertsEnabled = demo ? true : (flags.alertsEnabled || /^true$/i.test(process.env.ALERTS_ENABLED || ''))
 		if (alertsEnabled) {
-			this.log(`[alerts] ${demo ? 'demo-enabled' : 'enabled'}: interval=${flags.alertsIntervalSec || process.env.ALERTS_INTERVAL_SEC || 300}s, window=${flags.alertsWindowMin || process.env.ALERTS_WINDOW_MINUTES || 10}m`)
+			this.log(`[alerts] enabled: interval=${flags.alertsIntervalSec || process.env.ALERTS_INTERVAL_SEC || 300}s, window=${flags.alertsWindowMin || process.env.ALERTS_WINDOW_MINUTES || 10}m`)
 			void this.startAlertingLoop(flags, {demo})
 		} else {
 			this.log('[alerts] disabled')
@@ -157,6 +145,11 @@ export default class Daemon extends Command {
 
 		const severities: Array<'info'|'low'|'medium'|'high'|'critical'> = ['info','low','medium','high','critical']
 		const minSeverityIdx = severities.indexOf(minSeverity)
+
+		// Offer Slack setup if needed and interactive
+		if (channels.includes('slack')) {
+			await this.ensureSlackConfigured(slackWebhook)
+		}
 
 		const tick = async () => {
 			const now = Date.now()
@@ -281,7 +274,7 @@ export default class Daemon extends Command {
 
 	private async runDemoAlertLoop(flags: any): Promise<void> {
 		const intervalSec = Number(flags.alertsIntervalSec || process.env.ALERTS_INTERVAL_SEC || 30)
-		const demoMajorEvery = Number(flags.demoMajorReportEvery || process.env.DEMO_MAJOR_EVERY || 3)
+		const demoMajorEvery = Number(process.env.DEMO_MAJOR_EVERY || 3)
 		let tickCount = 0
 		const slackCfg = await getSlackConfig().catch(()=>undefined)
 		const channels = new Set((flags.alertsChannels || process.env.ALERTS_CHANNELS || 'slack').split(',').map((s: string)=>s.trim()).filter(Boolean))
@@ -295,9 +288,9 @@ export default class Daemon extends Command {
 				} else if (slackWebhook) {
 					await postSlack(slackWebhook, title, body)
 				} else {
-					this.log(`[demo] Slack not configured. Skipping.`)
+					this.log(`Slack not configured. Skipping.`)
 				}
-			} catch (e) { this.log(`[demo] Slack error: ${String((e as any)?.message || e)}`) }
+			} catch (e) { this.log(`Slack error: ${String((e as any)?.message || e)}`) }
 		}
 
 		const loop = async () => {
@@ -338,6 +331,37 @@ export default class Daemon extends Command {
 			}
 		}
 		void loop()
+	}
+
+	private async ensureSlackConfigured(slackWebhook?: string): Promise<void> {
+		try {
+			const cfg = await getSlackConfig()
+			if ((cfg?.botToken && cfg.channelId) || slackWebhook) return
+			if (!process.stdout.isTTY) return
+			const answers = await inquirer.prompt([
+				{ type: 'confirm', name: 'setup', message: 'Configure Slack bot for alerts now?', default: true },
+			])
+			if (!answers.setup) return
+			const {botToken, channel} = await inquirer.prompt([
+				{ type: 'password', name: 'botToken', message: 'Slack bot token (xoxb-...)', mask: '*', validate: (v: string)=>/^xoxb-/.test(v) || 'Must start with xoxb-' },
+				{ type: 'input', name: 'channel', message: 'Channel name or ID (e.g., incidents or C123...)', validate: (v: string)=>!!v || 'Required' },
+			])
+			const spin = ora('Validating bot token...').start()
+			try {
+				const auth = await validateSlackBot(botToken)
+				if (!auth.ok) throw new Error('Invalid bot token')
+				spin.succeed('Token valid')
+			} catch (e: any) { spin.fail(e.message || String(e)); return }
+			let channelId = channel
+			if (!/^C[A-Z0-9]/i.test(channelId)) {
+				const spin2 = ora('Resolving channel...').start()
+				try { channelId = await lookupChannelId(botToken, channel.replace(/^#/, '')); spin2.succeed(`Channel: ${channelId}`) } catch (e: any) { spin2.fail(e.message || String(e)); return }
+			}
+			const spin3 = ora('Sending Slack test message...').start()
+			try { await sendSlackBotMessage(botToken, channelId, ':rocket: AutoIR connected!'); spin3.succeed('Test sent') } catch (e: any) { spin3.fail(e.message || String(e)); return }
+			await setSlackConfig({ botToken, channelId, channelName: channel.replace(/^#/, '') })
+			this.log('Slack configuration saved.')
+		} catch {}
 	}
 }
 

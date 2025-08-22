@@ -82,47 +82,47 @@ export default class AutoirFargate extends Command {
     'alerts-logs-table': Flags.string({description: 'Alias of --alertsLogsTable'}),
     'slack-webhook-url': Flags.string({description: 'Alias of --slackWebhookUrl'}),
     'sns-topic-arn': Flags.string({description: 'Alias of --snsTopicArn'}),
-    // Demo
-    demo: Flags.boolean({description: 'Use local Docker to run a demo daemon and fake AWS status/logs', default: false}),
-    demoName: Flags.string({description: 'Demo container name', default: 'autoir-demo'}),
   }
 
   async run(): Promise<void> {
     const {args, flags} = await this.parse(AutoirFargate)
     const action = args.action as Action
 
-    if (flags.ensureTables && ['deploy','start'].includes(action) && !flags.demo) {
+    if (flags.ensureTables && ['deploy','start'].includes(action)) {
       await this.ensureTables(flags)
     }
 
+    // Automatic fallback to local Docker-based simulation if AWS is unavailable or misconfigured
+    const shouldSimulate = await this.shouldUseLocalSimulation(flags)
+
     switch (action) {
       case 'deploy':
-        if (flags.demo) {
-          await this.deployDemo(flags)
-        } else if (flags.localRun || flags['local-run']) {
+        if (flags.localRun || flags['local-run']) {
           await this.runLocalDaemon(flags)
+        } else if (shouldSimulate) {
+          await this.deployDemo(flags)
         } else {
           await this.deployStack(flags)
         }
         break
       case 'status':
-        if (flags.demo) await this.demoStatus(flags)
+        if (shouldSimulate) await this.demoStatus(flags)
         else await this.status(flags)
         break
       case 'logs':
-        if (flags.demo) await this.demoLogs(flags)
+        if (shouldSimulate) await this.demoLogs(flags)
         else await this.showLogs(flags)
         break
       case 'start':
-        if (flags.demo) await this.demoStart(flags)
+        if (shouldSimulate) await this.demoStart(flags)
         else await this.updateDesiredCount(flags, flags.desiredCount ?? 1)
         break
       case 'stop':
-        if (flags.demo) await this.demoStop(flags)
+        if (shouldSimulate) await this.demoStop(flags)
         else await this.updateDesiredCount(flags, 0)
         break
       case 'destroy':
-        if (flags.demo) await this.demoDestroy(flags)
+        if (shouldSimulate) await this.demoDestroy(flags)
         else await this.destroyStack(flags)
         break
     }
@@ -409,7 +409,7 @@ export default class AutoirFargate extends Command {
       if (flags.profile) args.unshift('--profile', flags.profile)
       const {stdout} = await execFileAsync('aws', args)
       const result = JSON.parse(stdout)
-      if (result.clusters && result.clusters.length > 0 && result.clusters[0].status === 'ACTIVE') {
+      if (Array.isArray(result.clusters) && result.clusters.length > 0 && result.clusters[0].status === 'ACTIVE') {
         ;(flags as any)._clusterExists = true
         this.log(chalk.gray(`Cluster exists: ${flags.cluster}`))
       } else {
@@ -497,7 +497,7 @@ export default class AutoirFargate extends Command {
     if (flags.region) loginArgs.unshift('--region', flags.region)
     if (flags.profile) loginArgs.unshift('--profile', flags.profile)
     const {stdout: pw} = await execFileAsync('aws', loginArgs)
-    await this.runStream('bash', ['-lc', `echo "$PW" | docker login --username AWS --password-stdin ${repoUri.split('/')[0]}`], {...process.env, PW: pw.trim()})
+    await this.runStream('bash', ['-lc', `echo \"$PW\" | docker login --username AWS --password-stdin ${repoUri.split('/')[0]}`], {...process.env, PW: pw.trim()})
 
     // Build context: ensure Dockerfile. If absent, build using a generated minimal Dockerfile in a temp dir
     const tag = flags.tag || 'latest'
@@ -517,8 +517,8 @@ export default class AutoirFargate extends Command {
 FROM node:20-bookworm\n\
 WORKDIR /app\n\
 COPY . .\n\
-RUN corepack enable && corepack prepare pnpm@10.14.0 --activate && pnpm install --frozen-lockfile || pnpm install && pnpm build\n\
-CMD ["node", "/app/bin/run.js", "daemon"]\n`
+RUN corepack enable and corepack prepare pnpm@10.14.0 --activate and pnpm install --frozen-lockfile or pnpm install and pnpm build\n\
+CMD [\"node\", \"/app/bin/run.js\", \"daemon\"]\n`
       await fs.writeFile(path.join(buildDir, 'Dockerfile'), dockerfile, 'utf8')
       // Create minimal package manifest to run daemon in container
       await fs.writeFile(path.join(buildDir, '.dockerignore'), 'node_modules\n.git\ndist\n', 'utf8')
@@ -576,26 +576,35 @@ CMD ["node", "/app/bin/run.js", "daemon"]\n`
     this.log(stdout.trim())
   }
 
-  // --- DEMO SUPPORT ---
+  // --- Automatic local simulation (Docker) ---
+  private async shouldUseLocalSimulation(flags: any): Promise<boolean> {
+    // Prefer simulation if Docker is available and AWS prerequisites are likely missing
+    const hasDocker = await this.checkDocker()
+    const hasAws = await this.checkAws(flags)
+    const missingVpcParams = !flags.vpcId || !flags.subnets
+    return hasDocker && (!hasAws || missingVpcParams)
+  }
+
   private async deployDemo(flags: any): Promise<void> {
     await this.ensureDocker()
-    this.log(chalk.cyan('Building local demo image (Dockerfile.autoir)...'))
+    this.log(chalk.cyan('Building local image (Dockerfile.autoir)...'))
     await this.runStream('docker', ['build','-f','Dockerfile.autoir','-t','autoir:demo','.' ])
-    this.log(chalk.cyan('Starting demo container in background...'))
+    this.log(chalk.cyan('Starting local container in background...'))
     // Remove existing container if exists
-    try { await execFileAsync('docker', ['rm','-f', flags.demoName]) } catch {}
-    const runArgs = ['run','-d','--name', flags.demoName,
-      '-e','DEMO_MODE=true',
+    const name = 'autoir-demo'
+    try { await execFileAsync('docker', ['rm','-f', name]) } catch {}
+    const runArgs = ['run','-d','--name', name,
       '-e','ALERTS_CHANNELS=' + (flags.alertsChannels || 'slack'),
       'autoir:demo']
     await this.runStream('docker', runArgs)
-    this.log(chalk.green(`Demo container '${flags.demoName}' is running. Use --demo status/logs to view.`))
+    this.log(chalk.green(`Local container '${name}' is running. Use status/logs to view.`))
   }
 
   private async demoStatus(flags: any): Promise<void> {
     await this.ensureDocker()
+    const name = 'autoir-demo'
     try {
-      const {stdout} = await execFileAsync('docker', ['inspect', flags.demoName, '--format', '{{json .State}}'])
+      const {stdout} = await execFileAsync('docker', ['inspect', name, '--format', '{{json .State}}'])
       const st = JSON.parse(stdout)
       const json = {
         service: flags.service || 'autoir',
@@ -616,31 +625,49 @@ CMD ["node", "/app/bin/run.js", "daemon"]\n`
 
   private async demoLogs(flags: any): Promise<void> {
     await this.ensureDocker()
-    const child = spawn('docker', ['logs','-f', flags.demoName], {stdio: 'inherit'})
+    const name = 'autoir-demo'
+    const child = spawn('docker', ['logs','-f', name], {stdio: 'inherit'})
     await new Promise<void>((resolve) => child.on('close', () => resolve()))
   }
 
   private async demoStart(flags: any): Promise<void> {
     await this.ensureDocker()
-    try { await execFileAsync('docker', ['start', flags.demoName]) } catch (e) { this.log(chalk.red(String(e))) }
+    const name = 'autoir-demo'
+    try { await execFileAsync('docker', ['start', name]) } catch (e) { this.log(chalk.red(String(e))) }
     await this.demoStatus(flags)
   }
 
   private async demoStop(flags: any): Promise<void> {
     await this.ensureDocker()
-    try { await execFileAsync('docker', ['stop', flags.demoName]) } catch (e) { this.log(chalk.red(String(e))) }
+    const name = 'autoir-demo'
+    try { await execFileAsync('docker', ['stop', name]) } catch (e) { this.log(chalk.red(String(e))) }
     await this.demoStatus(flags)
   }
 
   private async demoDestroy(flags: any): Promise<void> {
     await this.ensureDocker()
-    try { await execFileAsync('docker', ['rm','-f', flags.demoName]) } catch {}
-    this.log(chalk.green('Demo container removed.'))
+    const name = 'autoir-demo'
+    try { await execFileAsync('docker', ['rm','-f', name]) } catch {}
+    this.log(chalk.green('Local container removed.'))
   }
 
   private async ensureDocker(): Promise<void> {
     try { await execFileAsync('docker', ['version']) } catch {
-      this.error('Docker is required for demo mode. Please install and start Docker.')
+      this.error('Docker is required for local simulation. Please install and start Docker.')
     }
+  }
+
+  private async checkDocker(): Promise<boolean> {
+    try { await execFileAsync('docker', ['version']); return true } catch { return false }
+  }
+
+  private async checkAws(flags: any): Promise<boolean> {
+    try {
+      const args = ['sts', 'get-caller-identity', '--output', 'json']
+      if (flags.region) args.unshift('--region', flags.region)
+      if (flags.profile) args.unshift('--profile', flags.profile)
+      await execFileAsync('aws', args)
+      return true
+    } catch { return false }
   }
 }
