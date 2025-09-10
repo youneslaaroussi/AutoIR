@@ -1,7 +1,7 @@
 import blessed from 'blessed'
 import contrib from 'blessed-contrib'
 import {SageMakerRuntimeClient, InvokeEndpointCommand} from '@aws-sdk/client-sagemaker-runtime'
-import mysql from 'mysql2/promise'
+import mysql from '../lib/mysql-shim.js'
 import {Screen, ScreenContext} from '../lib/screen-manager.js'
 
 export class SearchScreen implements Screen {
@@ -207,7 +207,7 @@ export class SearchScreen implements Screen {
   }
 
   private async searchByVector(
-    pool: mysql.Pool,
+    pool: any,
     table: string,
     qVec: number[],
     group: string | undefined,

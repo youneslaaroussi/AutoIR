@@ -1,7 +1,7 @@
 import {Args, Command, Flags} from '@oclif/core'
 import {spawn} from 'node:child_process'
 import {setTimeout as wait} from 'node:timers/promises'
-import mysql from 'mysql2/promise'
+import mysql from '../../lib/mysql-shim.js'
 import {randomUUID} from 'node:crypto'
 import {getTiDBProfile, parseMySqlDsn, setTiDBProfile} from '../../lib/config.js'
 import enquirer from 'enquirer'
@@ -300,7 +300,7 @@ export default class LogsTail extends Command {
     })().catch(() => {})
   }
 
-  private async ensureTable(pool: mysql.Pool, table: string) {
+  private async ensureTable(pool: any, table: string) {
     // Create table if it does not exist with VECTOR(384)
     const createSql = `
       CREATE TABLE IF NOT EXISTS \`${table}\` (
@@ -316,7 +316,7 @@ export default class LogsTail extends Command {
     await pool.query(createSql)
 
     // Verify the column type is VECTOR; if not, stop with an explicit error
-    const [rows] = await pool.query<mysql.RowDataPacket[]>(
+    const [rows] = await pool.query(
       `SELECT DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = 'embedding'`,
       [table],
     )
@@ -327,7 +327,7 @@ export default class LogsTail extends Command {
   }
 
   private async insertBatch(
-    pool: mysql.Pool,
+    pool: any,
     table: string,
     events: LogEvent[],
     embeddings: number[][],

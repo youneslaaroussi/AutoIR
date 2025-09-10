@@ -1,7 +1,7 @@
 import {Command, Flags} from '@oclif/core'
 import chalk from 'chalk'
 import enquirer from 'enquirer'
-import mysql from 'mysql2/promise'
+import mysql from '../../lib/mysql-shim.js'
 import {getTiDBProfile, parseMySqlDsn, setTiDBProfile} from '../../lib/config.js'
 
 export default class TiDBSetDsn extends Command {

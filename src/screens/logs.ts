@@ -1,6 +1,6 @@
 import blessed from 'blessed'
 import contrib from 'blessed-contrib'
-import mysql from 'mysql2/promise'
+import mysql from '../lib/mysql-shim.js'
 import {Screen, ScreenContext} from '../lib/screen-manager.js'
 
 export class LogsScreen implements Screen {

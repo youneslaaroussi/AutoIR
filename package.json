@@ -10,8 +10,9 @@
   "dependencies": {
     "@aws-sdk/client-bedrock-runtime": "^3.864.0",
     "@aws-sdk/client-cloudwatch-logs": "^3.864.0",
-    "@aws-sdk/client-sns": "^3.864.0",
+    "@aws-sdk/client-s3": "3.884.0",
     "@aws-sdk/client-sagemaker-runtime": "^3.864.0",
+    "@aws-sdk/client-sns": "^3.864.0",
     "@oclif/core": "^4",
     "@oclif/plugin-help": "^6",
     "@oclif/plugin-plugins": "^5",
@@ -22,7 +23,9 @@
     "enquirer": "^2.4.1",
     "inquirer": "^12.9.2",
     "mysql2": "^3.11.3",
-    "ora": "^8.1.1"
+    "ora": "^8.1.1",
+    "pdfkit": "0.17.2",
+    "vectra": "0.11.1"
   },
   "devDependencies": {
     "@eslint/compat": "^1",
@@ -34,6 +37,7 @@
     "@types/jest": "^30.0.0",
     "@types/mocha": "^10",
     "@types/node": "^18",
+    "@types/pdfkit": "0.17.3",
     "chai": "^4",
     "eslint": "^9",
     "eslint-config-oclif": "^6",

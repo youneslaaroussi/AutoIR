@@ -1,7 +1,8 @@
-import mysql from 'mysql2/promise'
+import mysql from './mysql-shim.js'
+import type {RowDataPacket} from './mysql-shim.js'
 
 export async function ensureAutoIrTables(
-  pool: mysql.Pool,
+  pool: any,
   logsTable = 'autoir_log_events',
 ): Promise<void> {
   const createLogs = `
@@ -16,7 +17,7 @@ export async function ensureAutoIrTables(
     )`;
   await pool.query(createLogs)
 
-  const [rows] = await pool.query<mysql.RowDataPacket[]>(
+  const [rows] = await pool.query(
     `SELECT DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = 'embedding'`,
     [logsTable],
   )
@@ -56,8 +57,8 @@ export async function ensureAutoIrTables(
   await pool.query(createIncidents)
 }
 
-export async function getCursor(pool: mysql.Pool, pipelineId: string): Promise<number> {
-  const [rows] = await pool.query<mysql.RowDataPacket[]>(
+export async function getCursor(pool: any, pipelineId: string): Promise<number> {
+  const [rows] = await pool.query(
     'SELECT last_ts_ms FROM autoir_cursors WHERE pipeline_id = ? LIMIT 1',
     [pipelineId],
   )
@@ -65,7 +66,7 @@ export async function getCursor(pool: mysql.Pool, pipelineId: string): Promise<n
   return typeof last === 'number' ? last : 0
 }
 
-export async function setCursor(pool: mysql.Pool, pipelineId: string, lastTsMs: number, lastId?: string): Promise<void> {
+export async function setCursor(pool: any, pipelineId: string, lastTsMs: number, lastId?: string): Promise<void> {
   await pool.query(
     'INSERT INTO autoir_cursors (pipeline_id, last_ts_ms, last_id) VALUES (?,?,?) ON DUPLICATE KEY UPDATE last_ts_ms = VALUES(last_ts_ms), last_id = VALUES(last_id)',
     [pipelineId, lastTsMs, lastId || null],
@@ -96,11 +97,11 @@ export type NewIncident = Omit<IncidentRecord, 'id' | 'created_ms' | 'updated_ms
 }
 
 export async function upsertIncidentByDedupe(
-  pool: mysql.Pool,
+  pool: any,
   incident: NewIncident,
 ): Promise<{id: string; created: boolean}> {
   // Try find existing by dedupe_key
-  const [existRows] = await pool.query<mysql.RowDataPacket[]>(
+  const [existRows] = await pool.query(
     'SELECT id FROM autoir_incidents WHERE dedupe_key = ? LIMIT 1',
     [incident.dedupe_key],
   )

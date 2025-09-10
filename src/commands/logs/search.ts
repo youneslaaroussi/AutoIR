@@ -1,5 +1,5 @@
 import {Command, Flags} from '@oclif/core'
-import mysql from 'mysql2/promise'
+import mysql from '../../lib/mysql-shim.js'
 import {SageMakerRuntimeClient, InvokeEndpointCommand} from '@aws-sdk/client-sagemaker-runtime'
 import {CloudWatchLogsClient, DescribeLogGroupsCommand} from '@aws-sdk/client-cloudwatch-logs'
 import {spawn} from 'node:child_process'
@@ -670,7 +670,7 @@ ${result.message}`
   }
 
   private async searchByVector(
-    pool: mysql.Pool,
+    pool: any,
     table: string,
     qVec: number[],
     group: string | undefined,

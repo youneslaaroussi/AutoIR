@@ -1,5 +1,5 @@
 import {Args, Command, Flags} from '@oclif/core'
-import mysql from 'mysql2/promise'
+import mysql from '../../lib/mysql-shim.js'
 import chalk from 'chalk'
 import {SageMakerRuntimeClient, InvokeEndpointCommand} from '@aws-sdk/client-sagemaker-runtime'
 import {getTiDBProfile, parseMySqlDsn} from '../../lib/config.js'
@@ -112,7 +112,7 @@ export default class LogsQuery extends Command {
   }
 
   private async searchByVector(
-    pool: mysql.Pool,
+    pool: any,
     table: string,
     qVec: number[],
     group: string | undefined,

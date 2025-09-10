@@ -2,7 +2,7 @@ import {Args, Command, Flags} from '@oclif/core'
 import {promisify} from 'node:util'
 import {execFile, spawn} from 'node:child_process'
 import chalk from 'chalk'
-import mysql from 'mysql2/promise'
+import mysql from '../../lib/mysql-shim.js'
 import {getTiDBProfile, parseMySqlDsn} from '../../lib/config.js'
 import {ensureAutoIrTables} from '../../lib/db.js'
 
@@ -139,7 +139,7 @@ export default class AutoirFargate extends Command {
     const effMinConf = flags.alertsMinConfidence ?? flags['alerts-min-confidence'] ?? process.env.ALERTS_MIN_CONFIDENCE ?? 60
     const effMinSev = flags.alertsMinSeverity ?? flags['alerts-min-severity'] ?? process.env.ALERTS_MIN_SEVERITY ?? 'medium'
     const effChannels = (flags.alertsDryRun || flags['alerts-dry-run']) ? '' : (flags.alertsChannels ?? flags['alerts-channels'] ?? process.env.ALERTS_CHANNELS ?? '')
-    const effSlack = (flags.alertsDryRun || flags['alerts-dry-run']) ? '' : (flags.slackWebhookUrl ?? flags['slack-webhook-url'] ?? process.env.SLACK_WEBHOOK_URL ?? '')
+    const effSlack = ''
     const effSns = (flags.alertsDryRun || flags['alerts-dry-run']) ? '' : (flags.snsTopicArn ?? flags['sns-topic-arn'] ?? process.env.SNS_TOPIC_ARN ?? '')
     const effMaxEvents = flags.alertsMaxEvents ?? flags['alerts-max-events'] ?? process.env.ALERTS_MAX_EVENTS ?? 1000
     const effMaxSamples = flags.alertsMaxSamplesPerIssue ?? flags['alerts-max-samples-per-issue'] ?? process.env.ALERTS_MAX_SAMPLES_PER_ISSUE ?? 5
@@ -228,7 +228,7 @@ export default class AutoirFargate extends Command {
     const alertsMinConfidence = flags.alertsMinConfidence ?? flags['alerts-min-confidence'] ?? 60
     const alertsMinSeverity = flags.alertsMinSeverity ?? flags['alerts-min-severity'] ?? 'medium'
     const alertsChannels = flags.alertsChannels ?? flags['alerts-channels'] ?? ''
-    const slackWebhookUrl = flags.slackWebhookUrl ?? flags['slack-webhook-url'] ?? ''
+    const slackWebhookUrl = ''
     const snsTopicArn = flags.snsTopicArn ?? flags['sns-topic-arn'] ?? ''
     const alertsMaxEvents = flags.alertsMaxEvents ?? flags['alerts-max-events'] ?? 1000
     const alertsMaxSamplesPerIssue = flags.alertsMaxSamplesPerIssue ?? flags['alerts-max-samples-per-issue'] ?? 5

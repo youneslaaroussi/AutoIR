@@ -1,5 +1,5 @@
 import {Command, Flags} from '@oclif/core'
-import mysql from 'mysql2/promise'
+import mysql from '../lib/mysql-shim.js'
 import {StartupScreen, StartupProcess} from '../lib/startup.js'
 import {getTiDBProfile, parseMySqlDsn, readConfig, writeConfig, getFargateConfig, setFargateConfig} from '../lib/config.js'
 import blessed from 'blessed'
@@ -65,7 +65,7 @@ export default class AutoIR extends Command {
   }
 
   private state: AppState = AppState.INITIALIZING
-  private dbPool?: mysql.Pool
+  private dbPool?: any
   private smEndpoint?: string
   private smRegion?: string
 
@@ -630,7 +630,7 @@ export default class AutoIR extends Command {
   }
 
   private async searchByVector(
-    pool: mysql.Pool,
+    pool: any,
     table: string,
     qVec: number[],
     group: string | undefined,

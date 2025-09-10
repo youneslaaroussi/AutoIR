@@ -1,5 +1,5 @@
 import {BaseTool} from './base-tool.js'
-import mysql from 'mysql2/promise'
+import mysql from '../mysql-shim.js'
 import {getTiDBProfile} from '../config.js'
 
 export class TiDBQueryTool extends BaseTool {

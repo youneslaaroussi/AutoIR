@@ -1,12 +1,14 @@
 import {Command, Flags} from '@oclif/core'
 import {spawn} from 'node:child_process'
-import mysql from 'mysql2/promise'
+import mysql from '../lib/mysql-shim.js'
 import {parseMySqlDsn, setLlmConfig} from '../lib/config.js'
 import {ensureAutoIrTables, getCursor, setCursor, upsertIncidentByDedupe} from '../lib/db.js'
 import {ToolManager} from '../lib/tools/index.js'
 import {LlmClient, LlmMessage} from '../lib/llm/client.js'
 import crypto from 'node:crypto'
-import {SNSClient, PublishCommand} from '@aws-sdk/client-sns'
+import {SNSClient} from '@aws-sdk/client-sns'
+import {S3Client} from '@aws-sdk/client-s3'
+import {generateAndSendIncidentReport} from '../lib/alerts.js'
 import {execFile} from 'node:child_process'
 import {promisify} from 'node:util'
 
@@ -127,7 +129,10 @@ export default class Daemon extends Command {
     try { await llm.ensureConfigured(process.env.KIMI_ENDPOINT || undefined) } catch {}
 
     const snsArn = flags.snsTopicArn || process.env.SNS_TOPIC_ARN
-    const snsClient = snsArn ? new SNSClient({region: flags.region || process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION}) : undefined
+    const region = flags.region || process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION
+    const snsClient = snsArn ? new SNSClient({region}) : undefined
+    const s3Client = new S3Client({region})
+    const reportsBucket = process.env.REPORTS_BUCKET || 'autoir-reports'
 
     const intervalSec = Number(flags.alertsIntervalSec || process.env.ALERTS_INTERVAL_SEC || 300)
     const windowMin = Number(flags.alertsWindowMin || process.env.ALERTS_WINDOW_MINUTES || 10)
@@ -147,7 +152,7 @@ export default class Daemon extends Command {
       const sinceCursor = await getCursor(pool, 'alerts')
       const windowStart = Math.max(now - windowMin * 60_000, sinceCursor || now - windowMin * 60_000)
       try {
-        const [rows] = await pool.query<mysql.RowDataPacket[]>(
+        const [rows] = await pool.query(
           `SELECT id, log_group, log_stream, ts_ms, message
            FROM \`${table}\`
            WHERE ts_ms > ? AND ts_ms <= ? AND CHAR_LENGTH(message) >= 10
@@ -227,12 +232,31 @@ export default class Daemon extends Command {
           if (created) {
             // Notify
             const title = `[${severity.toUpperCase()}][${Math.round(confidence*100)}%] ${inc?.title || 'Issue detected'}`
-            const body = `${inc?.summary || ''}\nGroups: ${aggregates.map(a=>`${a.group}(${a.count})`).join(', ')}\nSamples: ${sample.length}`
-            if (channels.includes('slack') && slackWebhook) {
-              try { await postSlack(slackWebhook, title, body) } catch (e) { this.log(`[alerts] Slack error: ${String((e as any)?.message || e)}`) }
-            }
             if (channels.includes('sns') && snsClient && snsArn) {
-              try { await snsClient.send(new PublishCommand({TopicArn: snsArn, Subject: title.slice(0,100), Message: JSON.stringify({id, title, severity, confidence, summary: inc?.summary || '', aggregates, samples: sample.slice(0,2)})})) } catch (e) { this.log(`[alerts] SNS error: ${String((e as any)?.message || e)}`) }
+              try {
+                const report = await generateAndSendIncidentReport({
+                  region,
+                  bucket: reportsBucket,
+                  topicArn: snsArn,
+                  incident: {
+                    id,
+                    title,
+                    severity,
+                    confidence,
+                    summary: inc?.summary || '',
+                    aggregates,
+                    samples: sample.slice(0, Math.min(sample.length, 5)).map(s => ({
+                      timestamp: new Date(s.ts_ms).toISOString(),
+                      group: s.log_group,
+                      stream: s.log_stream,
+                      message: s.message
+                    }))
+                  }
+                })
+                this.log(`[alerts] Report available: ${report.url}`)
+              } catch (e) {
+                this.log(`[alerts] SNS/PDF error: ${String((e as any)?.message || e)}`)
+              }
             }
           }
         }
