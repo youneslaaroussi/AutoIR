@@ -169,13 +169,7 @@ export class LlmClient {
     }
     // Final response without tool calls. Optionally stream it
     if (options.stream && observer?.onStreamToken) {
-      if (this.provider === 'openai') {
-        observer.onStreamStart?.()
-        const streamed = await this.callOpenAIStream(messages, observer.onStreamToken)
-        observer.onStreamEnd?.()
-        finalContent = streamed
-        messages.push({role: 'assistant', content: finalContent})
-      } else if (this.provider === 'aws' && this.endpoint) {
+      if (this.endpoint) {
         observer.onStreamStart?.()
         const prompt = this.buildKimiPrompt(messages, this.toolManager.getAllTools())
         const streamed = await this.callKimiK2Stream(this.endpoint, prompt, options, observer.onStreamToken)
