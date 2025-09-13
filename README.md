@@ -1,16 +1,17 @@
-# AutoIR: Technical Whitepaper
+# AutoIR: Self-Hosted Agentic Incident Response Platform
 
 [![TiDB](https://img.shields.io/badge/TiDB-Serverless-red?style=for-the-badge)](https://tidbcloud.com/)
 [![AWS SageMaker](https://img.shields.io/badge/AWS-SageMaker-blue?style=for-the-badge&logo=amazonaws&logoColor=white)](https://aws.amazon.com/sagemaker/)
 [![AWS ECS Fargate](https://img.shields.io/badge/AWS-ECS%20Fargate-orange?style=for-the-badge&logo=amazonaws&logoColor=white)](https://aws.amazon.com/fargate/)
 [![CloudWatch Logs](https://img.shields.io/badge/AWS-CloudWatch_Logs-purple?style=for-the-badge&logo=amazonaws&logoColor=white)](https://aws.amazon.com/cloudwatch/)
 [![Kimi K2](https://img.shields.io/badge/Kimi-K2-00D4AA?style=for-the-badge)](https://github.com/KimiLearning/KimiK2)
+[![Self-Hosted](https://img.shields.io/badge/Deployment-Self--Hosted-green?style=for-the-badge)](https://github.com/youneslaaroussi/autoir)
 [![TypeScript](https://img.shields.io/badge/TypeScript-007ACC?style=for-the-badge&logo=typescript&logoColor=white)](https://typescriptlang.org/)
 [![Node.js](https://img.shields.io/badge/Node.js-18+-339933?style=for-the-badge&logo=node.js&logoColor=white)](https://nodejs.org/)
 [![oclif](https://img.shields.io/badge/CLI-oclif-0A0A0A?style=for-the-badge)](https://oclif.io/)
 [![Real-time Streaming](https://img.shields.io/badge/Streaming-Tokens-yellow?style=for-the-badge)](https://en.wikipedia.org/wiki/Server-sent_events)
 
-## Agentic Incident Response on TiDB + AWS + Kimi K2
+## Self-Hosted Agentic Incident Response on TiDB + AWS + Kimi K2
 
 ![AutoIR Architecture Overview](./media/AutoIR_Architecture_Diagram.png)
 
@@ -23,11 +24,11 @@ Large-scale systems generate massive, noisy logs. Traditional keyword search mis
 
 Built for the TiDB AgentX Hackathon, AutoIR showcases a real multi-step agent that ingests, embeds, searches, and explains—end to end.
 
-## System Deliverables & Outputs
+## Self-Hosted System Deliverables & Outputs
 
 ![](./media/carbon.png)
 
-AutoIR operates as a continuous monitoring and analysis platform, delivering actionable intelligence through multiple channels:
+AutoIR operates as a **self-hosted** continuous monitoring and analysis platform, delivering actionable intelligence through multiple channels:
 
 ### 1. Automated Incident Reports
 
@@ -102,11 +103,69 @@ The system operates with **99.9% uptime SLA**, processing **10K+ log events per 
 
 ![](./media/AutoIR_Fargate.gif)
 
-## Kimi K2 Integration
+## Cost Analysis (Reference Architecture)
+
+### Deployment Assumptions
+
+| Parameter | Development | Production |
+|-----------|-------------|------------|
+| **Region** | us-east-1 | us-east-1 |
+| **Operating Hours** | 8 hours/day (weekdays) | 24/7 |
+| **Kimi K2 Instance** | g6.8xlarge | g6.16xlarge |
+| **EBS Storage** | 250 GB gp3 | 500 GB gp3 |
+| **Fargate Tasks** | 1x (0.25 vCPU, 1 GB) | 2x (0.5 vCPU, 2 GB) |
+| **Embedding Requests** | 50K/month | 250K/month |
+| **CloudWatch Ingestion** | 2 GB/day | 8 GB/day |
+| **TiDB Tier** | Serverless | Dedicated (small) |
+
+### Monthly Cost Breakdown
+
+| Service Component | Development | Production | Notes |
+|-------------------|-------------|------------|-------|
+| **EC2 (Kimi K2)** | $400-600 | $2,800-3,400 | g6.8xlarge vs g6.16xlarge, hours/usage |
+| **EBS Storage** | $20 | $40 | 250GB vs 500GB gp3 volumes |
+| **ECS Fargate** | $12-18 | $36-54 | Task count and resource allocation |
+| **SageMaker Serverless** | $15-50 | $75-200 | BGE-small embeddings, usage-dependent |
+| **CloudWatch Logs** | $35-60 | $140-240 | Ingestion + storage + queries |
+| **TiDB** | $5-25 | $350-600 | Serverless vs Dedicated cluster |
+| **Data Transfer** | $5-15 | $20-50 | Inter-service communication |
+| **SNS + Misc** | $2-5 | $10-25 | Notifications and ancillary services |
+
+### Total Cost Summary
+
+| Deployment Type | Monthly Range | Annual Range | Key Characteristics |
+|-----------------|---------------|--------------|-------------------|
+| **Development** | $494-773 | $5,928-9,276 | 8h/day, smaller instances, serverless TiDB |
+| **Production** | $3,431-4,609 | $41,172-55,308 | 24/7, optimized instances, dedicated TiDB |
+| **Production (Reserved)** | $2,750-3,800 | $33,000-45,600 | 1-year RI savings (~20-25%) |
+
+### Cost Optimization Strategies
+
+| Strategy | Savings Potential | Implementation | Use Case |
+|----------|------------------|----------------|----------|
+| **Spot Instances** | 50-70% on EC2 | Use for dev/test workloads | Non-critical environments |
+| **Reserved Instances** | 20-42% on EC2 | 1-3 year commitments | Predictable production loads |
+| **Auto-scheduling** | 60-70% total | Stop instances off-hours | Development environments |
+| **Right-sizing** | 15-30% | Match instance to actual load | Over-provisioned resources |
+| **Embedding Caching** | 20-50% on SageMaker | Cache frequent queries | Repetitive log patterns |
+| **Log Filtering** | 30-60% on CloudWatch | Filter noisy/unnecessary logs | High-volume applications |
+
+### Break-even Analysis
+
+| Metric | Value | Calculation |
+|--------|-------|-------------|
+| **Cost per Incident Analysis** | $0.15-0.45 | Based on 8K-12K incidents/month |
+| **Cost per Log Event Processed** | $0.0003-0.0008 | Based on 5M-15M events/month |
+| **Cost per User (10 operators)** | $349-461/user/month | Production deployment |
+| **Break-even vs Traditional Tools** | 6-12 months | Compared to enterprise SIEM/monitoring |
+
+> **Note**: These are directional estimates for us-east-1 region. Actual costs will vary based on your specific usage patterns, region, and AWS pricing changes. Always validate with AWS Cost Calculator and monitor actual usage.
+
+## Self-Hosted Kimi K2 Integration
 
 ![LLM Processing Flow](./diagrams/out/llm_flow.svg)
 
-AutoIR leverages [Kimi K2](https://github.com/KimiLearning/KimiK2), a 32-billion parameter open-source language model developed by Moonshot AI, as its primary LLM for incident analysis and response generation. Kimi K2 provides:
+AutoIR leverages [Kimi K2](https://github.com/KimiLearning/KimiK2), a 32-billion parameter open-source language model developed by Moonshot AI, as its **self-hosted** primary LLM for incident analysis and response generation. Kimi K2 provides:
 
 - **32B activated parameters** with 1 trillion total parameters (Mixture-of-Experts architecture)
 - **Competitive performance** on knowledge tasks, mathematics, coding, and tool use
@@ -253,14 +312,14 @@ autoir aws kimi-k2-setup \
   --subnet-id subnet-87654321
 ```
 
-## Core Architecture Pillars
+## Self-Hosted Core Architecture Pillars
 
 ![System Overview](./diagrams/out/overview.svg)
 
-- **Vector-native log analytics**: Logs are embedded as 384-d vectors and stored in TiDB with cosine distance for semantic retrieval at query time.
-- **Serverless embeddings**: SageMaker Serverless Inference hosts the HF `BAAI/bge-small-en-v1.5` feature-extraction model; cold-start resistant and cost-efficient.
-- **Tool-based orchestration**: The agent can call constrained tools (`tidb_query`, `analysis`, etc.) to gather evidence and compute metrics before drafting incidents.
-- **Production-ready ingestion**: ECS Fargate daemon tails CloudWatch log groups, batches, embeds, and persists to TiDB.
+- **Self-hosted vector-native log analytics**: Logs are embedded as 384-d vectors and stored in TiDB with cosine distance for semantic retrieval at query time.
+- **Self-hosted serverless embeddings**: SageMaker Serverless Inference hosts the HF `BAAI/bge-small-en-v1.5` feature-extraction model; cold-start resistant and cost-efficient.
+- **Self-hosted tool-based orchestration**: The agent can call constrained tools (`tidb_query`, `analysis`, etc.) to gather evidence and compute metrics before drafting incidents.
+- **Self-hosted production-ready ingestion**: ECS Fargate daemon tails CloudWatch log groups, batches, embeds, and persists to TiDB.
 - **Safety by design**: The TiDB tool only allows SELECTs (LIMIT enforced), and analysis runs as a pure expression evaluator.
 
 ## Architecture: Components & Flow
@@ -330,11 +389,11 @@ CREATE TABLE IF NOT EXISTS autoir_incidents (
 
 The agent loops through tools up to 8 times to refine findings before producing a final incident write-up.
 
-## Quick Start
+## Self-Hosted Quick Start
 
 ### 🔧 Prerequisites & Infrastructure Requirements
 
-AutoIR requires the following cloud infrastructure components for full operation:
+AutoIR requires the following **self-hosted** cloud infrastructure components for full operation:
 
 #### **AWS Account with EC2 Access**
 ![AWS Infrastructure](./media/AWS.png)
