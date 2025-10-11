@@ -10,6 +10,10 @@ export interface Screen {
 
 export interface ScreenContext {
   dbPool?: any
+  os?: any
+  osIndex?: string
+  osEndpoint?: string
+  osRegion?: string
   smEndpoint?: string
   smRegion?: string
   flags: any

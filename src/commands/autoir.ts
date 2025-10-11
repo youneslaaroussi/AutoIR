@@ -1,7 +1,7 @@
 import {Command, Flags} from '@oclif/core'
-import mysql from 'mysql2/promise'
 import {StartupScreen, StartupProcess} from '../lib/startup.js'
-import {getTiDBProfile, parseMySqlDsn, readConfig, writeConfig, getFargateConfig, setFargateConfig} from '../lib/config.js'
+import {readConfig, writeConfig, getFargateConfig, setFargateConfig} from '../lib/config.js'
+import {OpenSearchClient} from '../lib/aws/opensearch.js'
 import blessed from 'blessed'
 import contrib from 'blessed-contrib'
 import {execFile, spawn} from 'node:child_process'
@@ -50,13 +50,9 @@ export default class AutoIR extends Command {
     'sagemaker-endpoint': Flags.string({description: 'SageMaker endpoint for embeddings'}),
     'sagemaker-region': Flags.string({description: 'AWS region for SageMaker endpoint'}),
     region: Flags.string({char: 'r', description: 'AWS region (fallback for SageMaker)'}),
-    table: Flags.string({description: 'TiDB table with logs', default: 'autoir_log_events'}),
-    'tidb-host': Flags.string({description: 'TiDB host (or endpoint)'}),
-    'tidb-port': Flags.integer({description: 'TiDB port', default: 4000}),
-    'tidb-user': Flags.string({description: 'TiDB user'}),
-    'tidb-password': Flags.string({description: 'TiDB password'}),
-    'tidb-database': Flags.string({description: 'TiDB database'}),
-    dsn: Flags.string({description: 'MySQL DSN: mysql://user:pass@host:port/db', env: 'TIDB_DSN'}),
+    index: Flags.string({description: 'OpenSearch index', default: 'autoir_log_events'}),
+    'opensearch-endpoint': Flags.string({description: 'OpenSearch endpoint', env: 'OPENSEARCH_ENDPOINT'}),
+    'opensearch-region': Flags.string({description: 'OpenSearch region', env: 'OPENSEARCH_REGION'}),
     'no-animation': Flags.boolean({description: 'Disable startup animation', default: false}),
     dashboard: Flags.boolean({description: 'Show combined dashboard (Fargate + search)', default: true}),
     cluster: Flags.string({description: 'ECS cluster name for dashboard', default: 'autoir'}),
@@ -65,7 +61,9 @@ export default class AutoIR extends Command {
   }
 
   private state: AppState = AppState.INITIALIZING
-  private dbPool?: mysql.Pool
+  private dbPool?: any
+  private osClient?: OpenSearchClient
+  private osIndex?: string
   private smEndpoint?: string
   private smRegion?: string
 
@@ -106,26 +104,18 @@ export default class AutoIR extends Command {
 
     const processes: StartupProcess[] = [
       {
-        name: 'tidb_connection',
-        description: 'Connecting to TiDB database',
+        name: 'opensearch_connection',
+        description: 'Connecting to Amazon OpenSearch',
         run: async () => {
-          const conn = await this.resolveTiDBConn(flags)
-          this.dbPool = mysql.createPool({
-            host: conn.host,
-            port: conn.port ?? 4000,
-            user: conn.user,
-            password: conn.password,
-            database: conn.database,
-            waitForConnections: true,
-            connectionLimit: 5,
-            ...( /tidbcloud\.com$/i.test(conn.host) ? {ssl: {minVersion: 'TLSv1.2', rejectUnauthorized: true}} : {}),
-          })
-          
-          // Test the connection
-          const testConn = await this.dbPool.getConnection()
-          testConn.release()
-          
-          return {host: conn.host, database: conn.database}
+          const osEndpoint = flags['opensearch-endpoint'] || process.env.OPENSEARCH_ENDPOINT
+          const osRegion = flags['opensearch-region'] || process.env.OPENSEARCH_REGION || flags.region
+          if (!osEndpoint || !osRegion) throw new Error('Missing OpenSearch endpoint/region. Provide flags or set env.')
+          const index = flags.index || 'autoir_log_events'
+          const client = new OpenSearchClient({endpoint: osEndpoint, region: osRegion})
+          await client.ensureIndex(index, 384)
+          this.osClient = client
+          this.osIndex = index
+          return {endpoint: osEndpoint, index}
         }
       },
       {
@@ -260,7 +250,7 @@ export default class AutoIR extends Command {
           top: 'center', left: 'center', width: '70%', height: '40%',
           border: {type: 'line'}, label: ' Welcome to AutoIR ', tags: true,
           style: {fg: 'white', bg: 'black', border: {fg: 'cyan'}},
-          content: '{center}AutoIR will check your TiDB connection, AWS auth, and embedding endpoint.\n\nAfter setup, a combined dashboard with built-in semantic search will open.\\n\\nPress any key to continue.{/center}'
+          content: '{center}AutoIR will check your AWS auth, OpenSearch connectivity, and embedding endpoint.\n\nAfter setup, a combined dashboard with built-in semantic search will open.\\n\\nPress any key to continue.{/center}'
         })
         screen.render()
         await new Promise<void>(resolve => screen.once('keypress', () => resolve()))
@@ -285,6 +275,10 @@ export default class AutoIR extends Command {
 
     const context = {
       dbPool: this.dbPool,
+      os: this.osClient,
+      osIndex: this.osIndex,
+      osEndpoint: (flags['opensearch-endpoint'] || process.env.OPENSEARCH_ENDPOINT),
+      osRegion: (flags['opensearch-region'] || process.env.OPENSEARCH_REGION || flags.region),
       smEndpoint: this.smEndpoint,
       smRegion: this.smRegion,
       flags,
@@ -321,20 +315,7 @@ export default class AutoIR extends Command {
     this.state = AppState.DASHBOARD
   }
 
-  private async resolveTiDBConn(flags: any): Promise<{host: string; port?: number; user: string; password?: string; database: string}> {
-    const saved = await getTiDBProfile('default')
-    const viaDsn = flags.dsn ? parseMySqlDsn(flags.dsn) : (process.env.TIDB_DSN ? parseMySqlDsn(process.env.TIDB_DSN) : undefined)
-    const viaFlags = (flags['tidb-host'] && flags['tidb-user'] && flags['tidb-database']) ? {
-      host: flags['tidb-host'],
-      port: flags['tidb-port'],
-      user: flags['tidb-user'],
-      password: flags['tidb-password'],
-      database: flags['tidb-database'],
-    } : undefined
-    const conn = saved ?? viaDsn ?? viaFlags
-    if (!conn) this.error('Missing TiDB connection. Provide --dsn or host/user/database flags, or save a profile.')
-    return conn as any
-  }
+  // TiDB resolver removed in AWS-only stack
 
   private async cleanup(): Promise<void> {
     if (this.dbPool) {

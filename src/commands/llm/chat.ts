@@ -30,17 +30,14 @@ interface Conversation {
 }
 
 export default class LlmChat extends Command {
-  static description = 'Chat with an LLM (AWS Kimi K2 or OpenAI) with conversation history, streaming, and function calling'
+  static description = 'Chat with an LLM (Amazon Bedrock or OpenAI) with conversation history, streaming, and function calling'
 
   static examples = [
-    '<%= config.bin %> <%= command.id %> --endpoint my-kimi-k2',
-    '<%= config.bin %> <%= command.id %> --endpoint my-kimi-k2 --message "Hello, how are you?"',
-    '<%= config.bin %> <%= command.id %> --endpoint my-kimi-k2 --conversation my-chat --stream',
-    '<%= config.bin %> <%= command.id %> --endpoint my-kimi-k2 --list-conversations',
+    '<%= config.bin %> <%= command.id %> --endpoint us.amazon.nova-micro-v1:0',
   ]
 
   static flags = {
-    endpoint: Flags.string({description: 'AWS/Kimi K2 endpoint name from saved config'}),
+    endpoint: Flags.string({description: 'Amazon Bedrock model ID to use'}),
     message: Flags.string({description: 'Single message to send (for non-interactive mode)'}),
     conversation: Flags.string({description: 'Conversation ID to continue or create'}),
     'system-prompt': Flags.string({description: 'System prompt to use'}),
@@ -67,7 +64,7 @@ export default class LlmChat extends Command {
     
     // Initialize directories
     this.conversationsDir = path.join(os.homedir(), '.autoir', 'conversations')
-    this.configPath = path.join(os.homedir(), '.autoir', 'kimi-k2-endpoints.json')
+    this.configPath = path.join(os.homedir(), '.autoir', 'bedrock-models.json')
     
     await fs.mkdir(this.conversationsDir, {recursive: true})
 
@@ -77,7 +74,7 @@ export default class LlmChat extends Command {
     await this.llm.ensureConfigured(endpointName)
     if (endpointName) {
       endpointConfig = await this.loadEndpointConfig(endpointName)
-      if (!endpointConfig) this.error(`Endpoint '${endpointName}' not found. Use 'autoir aws kimi-k2-list' to see available endpoints.`)
+      // No pre-saved check needed for Bedrock; proceed
     }
 
     // Handle special commands

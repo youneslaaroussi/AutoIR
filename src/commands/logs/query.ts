@@ -1,8 +1,7 @@
 import {Args, Command, Flags} from '@oclif/core'
-import mysql from 'mysql2/promise'
 import chalk from 'chalk'
 import {SageMakerRuntimeClient, InvokeEndpointCommand} from '@aws-sdk/client-sagemaker-runtime'
-import {getTiDBProfile, parseMySqlDsn} from '../../lib/config.js'
+import {OpenSearchClient} from '../../lib/aws/opensearch.js'
 
 type Row = {
   id: string
@@ -13,7 +12,7 @@ type Row = {
 }
 
 export default class LogsQuery extends Command {
-  static description = 'Semantic search over ingested logs using embeddings stored in TiDB'
+  static description = 'Semantic search over ingested logs stored in Amazon OpenSearch (vector search)'
 
   static examples = [
     '<%= config.bin %> <%= command.id %> "stripe error checkout" --region us-east-1 --sagemaker-endpoint autoir-embed-ep-srv --sagemaker-region us-east-1',
@@ -27,18 +26,14 @@ export default class LogsQuery extends Command {
     region: Flags.string({char: 'r', description: 'AWS region for CloudWatch (unused here, for symmetry)'}),
     profile: Flags.string({char: 'p', description: 'AWS profile (unused here, for symmetry)'}),
 
-    table: Flags.string({description: 'TiDB table with logs', default: 'autoir_log_events'}),
+    index: Flags.string({description: 'OpenSearch index name', default: 'autoir_log_events'}),
     group: Flags.string({description: 'Filter by CloudWatch log group name'}),
     since: Flags.string({description: 'Time window for candidates (e.g., 1h, 24h, 7d)'}),
     limit: Flags.integer({description: 'Top results to return', default: 20}),
     'min-len': Flags.integer({description: 'Minimum message length to consider', default: 32}),
 
-    dsn: Flags.string({description: 'MySQL DSN: mysql://user:pass@host:port/db', env: 'TIDB_DSN'}),
-    'tidb-host': Flags.string({description: 'TiDB host (or endpoint)'}),
-    'tidb-port': Flags.integer({description: 'TiDB port', default: 4000}),
-    'tidb-user': Flags.string({description: 'TiDB user'}),
-    'tidb-password': Flags.string({description: 'TiDB password'}),
-    'tidb-database': Flags.string({description: 'TiDB database'}),
+    'opensearch-endpoint': Flags.string({description: 'OpenSearch endpoint', env: 'OPENSEARCH_ENDPOINT'}),
+    'opensearch-region': Flags.string({description: 'OpenSearch region', env: 'OPENSEARCH_REGION'}),
 
     'sagemaker-endpoint': Flags.string({description: 'SageMaker endpoint for embeddings', required: true}),
     'sagemaker-region': Flags.string({description: 'AWS region for SageMaker endpoint'}),
@@ -51,18 +46,10 @@ export default class LogsQuery extends Command {
     const {args, flags} = await this.parse(LogsQuery)
     const queryText = args.query
 
-    // Connect TiDB via DSN, saved profile, or flags
-    const conn = await this.resolveTiDBConn(flags)
-    const pool = mysql.createPool({
-      host: conn.host,
-      port: conn.port ?? 4000,
-      user: conn.user,
-      password: conn.password,
-      database: conn.database,
-      waitForConnections: true,
-      connectionLimit: 5,
-      ...( /tidbcloud\.com$/i.test(conn.host) ? {ssl: {minVersion: 'TLSv1.2', rejectUnauthorized: true}} : {}),
-    })
+    const osEndpoint = flags['opensearch-endpoint'] || process.env.OPENSEARCH_ENDPOINT
+    const osRegion = flags['opensearch-region'] || process.env.OPENSEARCH_REGION || flags.region
+    if (!osEndpoint || !osRegion) this.error('OpenSearch endpoint/region required')
+    const os = new OpenSearchClient({endpoint: osEndpoint, region: osRegion})
 
     // Embed the query via SageMaker
     const qVec = await this.embedQuerySageMaker(queryText, flags['sagemaker-endpoint']!, flags['sagemaker-region'] || flags.region)
@@ -72,14 +59,11 @@ export default class LogsQuery extends Command {
     }
 
     // Server-side vector search using TiDB VECTOR and cosine distance
-    const top = await this.searchByVector(
-      pool,
-      flags.table!,
+    const top = await os.searchByVector(
+      flags.index!,
       qVec,
-      flags.group,
-      flags.since,
       flags.limit!,
-      flags['min-len']!,
+      {group: flags.group, sinceMs: flags.since ? this.parseSince(flags.since) : undefined, minLen: flags['min-len']!}
     )
 
     if (flags.json) {
@@ -93,52 +77,10 @@ export default class LogsQuery extends Command {
       if (top.length === 0) this.log(chalk.yellow('No results'))
     }
 
-    await pool.end()
+    // nothing to close
   }
 
-  private async resolveTiDBConn(flags: any): Promise<{host: string; port?: number; user: string; password?: string; database: string}> {
-    const saved = await getTiDBProfile('default')
-    const viaDsn = flags.dsn ? parseMySqlDsn(flags.dsn) : (process.env.TIDB_DSN ? parseMySqlDsn(process.env.TIDB_DSN) : undefined)
-    const viaFlags = (flags['tidb-host'] && flags['tidb-user'] && flags['tidb-database']) ? {
-      host: flags['tidb-host'],
-      port: flags['tidb-port'],
-      user: flags['tidb-user'],
-      password: flags['tidb-password'],
-      database: flags['tidb-database'],
-    } : undefined
-    const conn = saved ?? viaDsn ?? viaFlags
-    if (!conn) this.error('Missing TiDB connection. Provide --dsn or host/user/database flags, or save a profile.')
-    return conn as any
-  }
-
-  private async searchByVector(
-    pool: mysql.Pool,
-    table: string,
-    qVec: number[],
-    group: string | undefined,
-    since: string | undefined,
-    limit: number,
-    minLen: number,
-  ): Promise<Array<Row & {distance: number}>> {
-    const where: string[] = ['CHAR_LENGTH(message) >= ?']
-    const params: any[] = [JSON.stringify(qVec), minLen]
-    if (group) { where.push('log_group = ?'); params.push(group) }
-    if (since) {
-      const cutoff = this.parseSince(since)
-      if (cutoff) { where.push('ts_ms >= ?'); params.push(cutoff) }
-    }
-    const sql = `
-      SELECT id, log_group, log_stream, ts_ms, message,
-             vec_cosine_distance(embedding, CAST(? AS VECTOR(384))) AS distance
-      FROM \`${table}\`
-      ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
-      ORDER BY distance ASC
-      LIMIT ?
-    `
-    params.push(limit)
-    const [rows] = await pool.query(sql, params)
-    return rows as Array<Row & {distance: number}>
-  }
+  // Vector search now handled by OpenSearch client
 
   private parseSince(s: string): number | undefined {
     const now = Date.now()

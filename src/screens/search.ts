@@ -1,7 +1,6 @@
 import blessed from 'blessed'
 import contrib from 'blessed-contrib'
 import {SageMakerRuntimeClient, InvokeEndpointCommand} from '@aws-sdk/client-sagemaker-runtime'
-import mysql from 'mysql2/promise'
 import {Screen, ScreenContext} from '../lib/screen-manager.js'
 
 export class SearchScreen implements Screen {
@@ -136,10 +135,10 @@ export class SearchScreen implements Screen {
     })
     this.resultsTable.screen.render()
 
-    if (!context.dbPool) {
+    if (!context.os || !context.osIndex) {
       this.resultsTable.setData({
         headers: ['Timestamp', 'Group', 'Stream', 'Message'],
-        data: [['Error', '', '', 'Database not connected']]
+        data: [['Error', '', '', 'OpenSearch not configured']]
       })
       this.resultsTable.screen.render()
       return
@@ -156,15 +155,7 @@ export class SearchScreen implements Screen {
 
     try {
       const vec = await this.embedQuery(query, context.smEndpoint, context.smRegion)
-      const results = await this.searchByVector(
-        context.dbPool, 
-        context.flags.table || 'autoir_log_events', 
-        vec, 
-        undefined, 
-        undefined, 
-        20, 
-        32
-      )
+      const results = await context.os.searchByVector(context.osIndex!, vec, 20, {minLen: 32})
       
       const rows = results.map((r: any) => [
         new Date(r.ts_ms).toLocaleString(),
@@ -178,7 +169,7 @@ export class SearchScreen implements Screen {
         data: rows.length > 0 ? rows : [['No results', '', '', 'Try a different search query']]
       })
       
-      this.statusText.setContent(`Database: Connected • Endpoint: Ready • Last Search: ${new Date().toLocaleTimeString()} • Found ${results.length} results`)
+      this.statusText.setContent(`OpenSearch: Ready • Endpoint: Ready • Last Search: ${new Date().toLocaleTimeString()} • Found ${results.length} results`)
       this.resultsTable.screen.render()
     } catch (error: any) {
       this.resultsTable.setData({
@@ -206,32 +197,7 @@ export class SearchScreen implements Screen {
     return vec.map((v: any) => Number(v))
   }
 
-  private async searchByVector(
-    pool: mysql.Pool,
-    table: string,
-    qVec: number[],
-    group: string | undefined,
-    since: string | undefined,
-    limit: number,
-    minLen: number,
-  ): Promise<Array<{id: string; log_group: string; log_stream: string; ts_ms: number; message: string; distance: number}>> {
-    const where: string[] = ['CHAR_LENGTH(message) >= ?']
-    const params: any[] = [minLen]
-    if (group) { where.push('log_group = ?'); params.push(group) }
-    if (since) {
-      const ms = this.parseSince(since)
-      if (ms) { where.push('ts_ms >= ?'); params.push(ms) }
-    }
-    const sql = `SELECT id, log_group, log_stream, ts_ms, message,
-      1 - (embedding <=> CAST(? AS VECTOR(384))) AS score,
-      (embedding <=> CAST(? AS VECTOR(384))) AS distance
-      FROM \`${table}\`
-      ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
-      ORDER BY distance ASC
-      LIMIT ?`
-    const [rows] = await pool.query(sql, [JSON.stringify(qVec), JSON.stringify(qVec), ...params, limit])
-    return rows as any
-  }
+  // Vector search handled by OpenSearch client via context.os
 
   private parseSince(expr: string): number | undefined {
     const m = /^([0-9]+)([smhd])$/.exec(String(expr||''))

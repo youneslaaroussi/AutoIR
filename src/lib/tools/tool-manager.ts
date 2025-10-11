@@ -3,7 +3,7 @@ import {TimeTool} from './time-tool.js'
 import {CalculatorTool} from './calculator-tool.js'
 import {FileReadTool, FileWriteTool} from './file-tool.js'
 // import {WebSearchTool} from './web-search-tool.js'
-import {TiDBQueryTool} from './tidb-tool.js'
+// TiDB tool removed in AWS-only stack
 import {AnalysisTool} from './analysis-tool.js'
 
 export class ToolManager {
@@ -19,7 +19,7 @@ export class ToolManager {
     this.registerTool(new FileReadTool())
     this.registerTool(new FileWriteTool())
     // Web search disabled per product requirements
-    this.registerTool(new TiDBQueryTool())
+    // Vector/database queries are served via AWS services in app code
     this.registerTool(new AnalysisTool())
   }
 

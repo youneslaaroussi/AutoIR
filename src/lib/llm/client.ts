@@ -25,8 +25,8 @@ export interface LlmOptions {
 }
 
 export class LlmClient {
-  private provider: 'aws' | 'openai' = 'aws'
-  private endpoint?: string
+  private provider: 'bedrock' | 'openai' = 'bedrock'
+  private bedrockModel?: string
   private openaiApiKey?: string
   private openaiModel: string = 'gpt-4o-mini'
 
@@ -36,7 +36,7 @@ export class LlmClient {
     const llm = await getLlmConfig()
     if (!llm?.provider) {
       const {provider} = await inquirer.prompt([{type: 'list', name: 'provider', message: 'Choose LLM provider', choices: [
-        {name: 'AWS self-hosted (Kimi K2)', value: 'aws'},
+        {name: 'Amazon Bedrock', value: 'bedrock'},
         {name: 'OpenAI', value: 'openai'}
       ]}])
       if (provider === 'openai') {
@@ -46,22 +46,23 @@ export class LlmClient {
         ])
         await setLlmConfig({provider: 'openai', openaiApiKey: apiKey, openaiModel: model})
       } else {
-        await setLlmConfig({provider: 'aws', currentEndpoint: preferredEndpoint})
+        const {model} = await inquirer.prompt([{type:'input', name:'model', message:'Bedrock model ID', default: process.env.BEDROCK_MODEL || 'us.amazon.nova-micro-v1:0'}])
+        await setLlmConfig({provider: 'bedrock', openaiApiKey: undefined as any, openaiModel: undefined as any, currentEndpoint: model as any})
       }
     }
 
     const cfg = await getLlmConfig()
-    this.provider = (cfg?.provider as any) || 'aws'
+    this.provider = (cfg?.provider as any) || 'bedrock'
     if (this.provider === 'openai') {
       this.openaiApiKey = cfg?.openaiApiKey
       this.openaiModel = cfg?.openaiModel || this.openaiModel
     } else {
-      this.endpoint = preferredEndpoint || cfg?.currentEndpoint
+      this.bedrockModel = preferredEndpoint || (cfg?.currentEndpoint as any) || process.env.BEDROCK_MODEL || 'us.amazon.nova-micro-v1:0'
     }
   }
 
   getProviderLabel(): string {
-    return this.provider === 'aws' ? 'Kimi K2 (AWS)' : 'OpenAI'
+    return this.provider === 'bedrock' ? 'Amazon Bedrock' : 'OpenAI'
   }
 
   buildSystemPrompt(): string {
@@ -70,10 +71,9 @@ export class LlmClient {
   }
 
   async send(messages: LlmMessage[], options: LlmOptions): Promise<{content: string; tool_calls?: ToolCall[]; raw?: any}> {
-    if (this.provider === 'aws') {
-      if (!this.endpoint) throw new Error('AWS/Kimi K2 endpoint not configured')
-      const prompt = this.buildKimiPrompt(messages, this.toolManager.getAllTools())
-      return this.callKimiK2(this.endpoint, prompt, options)
+    if (this.provider === 'bedrock') {
+      if (!this.bedrockModel) throw new Error('Bedrock model not configured')
+      return this.callBedrock(messages, options)
     } else {
       return this.callOpenAI(messages, options)
     }
@@ -102,65 +102,48 @@ export class LlmClient {
     return prompt
   }
 
-  private async callKimiK2(endpoint: string, prompt: string, options: LlmOptions): Promise<any> {
-    const payload = {prompt, temperature: options.temperature, min_p: 0.01, n_predict: options.maxTokens, stream: options.stream}
+  private async callBedrock(messages: LlmMessage[], options: LlmOptions): Promise<any> {
+    const {BedrockRuntimeClient, ConverseCommand} = await import('@aws-sdk/client-bedrock-runtime')
+    const region = process.env.BEDROCK_REGION || process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || 'us-east-1'
+    const client = new BedrockRuntimeClient({region})
+    const toolDefs = this.toolManager.getAllTools().map(t => ({
+      toolSpec: {
+        name: t.name,
+        description: t.description,
+        inputSchema: {json: t.parameters as any}
+      }
+    }))
+    const brMessages = messages.map(m => ({
+      role: m.role === 'tool' ? 'user' : m.role, // Bedrock lacks explicit tool role; pass tool outputs as user content
+      content: [{text: m.content}]
+    }))
+    const input = {
+      modelId: this.bedrockModel!,
+      conversationStateConfig: {}
+    } as any
+    const command = new ConverseCommand({
+      modelId: this.bedrockModel!,
+      inferenceConfig: {temperature: options.temperature, maxTokens: options.maxTokens},
+      toolConfig: toolDefs.length ? {tools: toolDefs} : undefined,
+      messages: brMessages
+    } as any)
     try {
-      const {stdout} = await execFileAsync('curl', ['-s', '-X', 'POST', '-H', 'Content-Type: application/json', '-d', JSON.stringify(payload), `${endpoint}/completion`])
-      const response = JSON.parse(stdout)
-      return {content: response.content || '', tool_calls: response.tool_calls || [], raw: response}
+      const resp: any = await client.send(command)
+      const text = resp?.output?.message?.content?.[0]?.text || ''
+      // TODO: Map tool calls if using AgentCore primitives later
+      return {content: text, tool_calls: undefined, raw: resp}
     } catch (e: any) {
-      const msg = e?.stderr || e?.message || String(e)
+      const msg = e?.message || String(e)
       return {content: `Error: ${msg}`, tool_calls: undefined, raw: {error: msg}}
     }
   }
 
-  private async callKimiK2Stream(endpoint: string, prompt: string, options: LlmOptions, onToken: (t: string) => void): Promise<string> {
-    const payload = {prompt, temperature: options.temperature, min_p: 0.01, n_predict: options.maxTokens, stream: true}
-    const args = [
-      '-s', '-N', '-X', 'POST',
-      '-H', 'Content-Type: application/json',
-      '-d', JSON.stringify(payload),
-      `${endpoint}/completion`
-    ]
-    return await new Promise<string>((resolve) => {
-      const {spawn} = require('node:child_process') as typeof import('node:child_process')
-      const child = spawn('curl', args)
-      let final = ''
-      let buffer = ''
-      const processLine = (line: string) => {
-        const trimmed = line.trim()
-        if (!trimmed) return
-        // Support SSE-style lines (data: {...}) and raw JSON lines
-        const jsonPart = trimmed.startsWith('data:') ? trimmed.slice(5).trim() : trimmed
-        if (jsonPart === '[DONE]') { try { child.kill() } catch {} ; return }
-        try {
-          const obj = JSON.parse(jsonPart)
-          const token = typeof obj?.content === 'string' ? obj.content : (typeof obj?.delta === 'string' ? obj.delta : '')
-          if (token) { final += token; onToken(token) }
-        } catch {
-          // Fallback: treat as plain text chunk
-          final += jsonPart
-          onToken(jsonPart)
-        }
-      }
-      child.stdout.on('data', (chunk: Buffer) => {
-        buffer += chunk.toString()
-        let idx
-        while ((idx = buffer.indexOf('\n')) >= 0) {
-          const line = buffer.slice(0, idx)
-          buffer = buffer.slice(idx + 1)
-          processLine(line)
-        }
-      })
-      child.on('close', () => resolve(final))
-      child.on('error', () => resolve(final))
-    })
-  }
+  // Streaming via Bedrock will be implemented when available in this flow
 
   private async callOpenAI(messages: LlmMessage[], options: LlmOptions): Promise<any> {
     if (!this.openaiApiKey) throw new Error('OpenAI API key missing')
     // Expose only approved tools to OpenAI
-    const allowed = this.toolManager.getAllTools().filter(t => ['tidb_query','analysis','get_current_time','calculate','read_file','write_file'].includes(t.name))
+    const allowed = this.toolManager.getAllTools().filter(t => ['analysis','get_current_time','calculate','read_file','write_file'].includes(t.name))
     const openAiTools = allowed.map(t => ({
       type: 'function',
       function: { name: t.name, description: t.description, parameters: t.parameters }
@@ -241,13 +224,6 @@ export class LlmClient {
       if (this.provider === 'openai') {
         observer.onStreamStart?.()
         const streamed = await this.callOpenAIStream(messages, observer.onStreamToken)
-        observer.onStreamEnd?.()
-        finalContent = streamed
-        messages.push({role: 'assistant', content: finalContent})
-      } else if (this.provider === 'aws' && this.endpoint) {
-        observer.onStreamStart?.()
-        const prompt = this.buildKimiPrompt(messages, this.toolManager.getAllTools())
-        const streamed = await this.callKimiK2Stream(this.endpoint, prompt, options, observer.onStreamToken)
         observer.onStreamEnd?.()
         finalContent = streamed
         messages.push({role: 'assistant', content: finalContent})

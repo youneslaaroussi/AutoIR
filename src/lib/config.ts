@@ -12,10 +12,6 @@ export type TiDBProfile = {
 }
 
 export type AppConfig = {
-  tidb?: {
-    profiles: Record<string, TiDBProfile>
-    current?: string
-  }
   embed?: {
     provider?: 'sagemaker' | 'bedrock' | 'none'
     // SageMaker embedding endpoint configuration
@@ -26,8 +22,8 @@ export type AppConfig = {
     bedrockModel?: string
   }
   llm?: {
-    provider?: 'aws' | 'openai'
-    // For AWS/Kimi K2 backend, we reuse saved endpoints file; keep current selected name here
+    provider?: 'bedrock' | 'openai'
+    // For Bedrock backend, store selected model here
     currentEndpoint?: string
     // For OpenAI backend
     openaiApiKey?: string
@@ -59,34 +55,17 @@ export async function writeConfig(cfg: AppConfig): Promise<void> {
 
 export async function getTiDBProfile(name = 'default'): Promise<TiDBProfile | undefined> {
   const cfg = await readConfig()
-  const profiles = cfg.tidb?.profiles || {}
-  const key = name || cfg.tidb?.current || 'default'
-  return profiles[key]
+  // TiDB removed in AWS-only stack
+  return undefined
 }
 
 export async function setTiDBProfile(name: string, profile: TiDBProfile, makeCurrent = true): Promise<void> {
-  const cfg = await readConfig()
-  if (!cfg.tidb) cfg.tidb = {profiles: {}, current: undefined}
-  cfg.tidb.profiles[name] = profile
-  if (makeCurrent) cfg.tidb.current = name
-  await writeConfig(cfg)
+  // No-op in AWS-only stack
 }
 
 export function parseMySqlDsn(dsn: string): TiDBProfile | undefined {
-  try {
-    const u = new URL(dsn)
-    if (u.protocol !== 'mysql:' && u.protocol !== 'mysqls:') return undefined
-    const profile: TiDBProfile = {
-      host: u.hostname,
-      port: u.port ? Number(u.port) : undefined,
-      user: decodeURIComponent(u.username),
-      password: u.password ? decodeURIComponent(u.password) : undefined,
-      database: u.pathname.replace(/^\//, ''),
-    }
-    return profile
-  } catch {
-    return undefined
-  }
+  // No MySQL/TiDB in AWS-only stack
+  return undefined
 }
 
 export async function getEmbedConfig(): Promise<Required<NonNullable<AppConfig['embed']>> | undefined> {

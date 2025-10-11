@@ -2,9 +2,8 @@ import {Args, Command, Flags} from '@oclif/core'
 import {promisify} from 'node:util'
 import {execFile, spawn} from 'node:child_process'
 import chalk from 'chalk'
-import mysql from 'mysql2/promise'
-import {getTiDBProfile, parseMySqlDsn} from '../../lib/config.js'
-import {ensureAutoIrTables} from '../../lib/db.js'
+// TiDB removed in AWS-only stack
+// DB table ensure removed; using OpenSearch index
 
 const execFileAsync = promisify(execFile)
 
@@ -43,8 +42,9 @@ export default class AutoirFargate extends Command {
     autoBuild: Flags.boolean({description: 'Build and push a container image automatically', default: true}),
     repo: Flags.string({description: 'ECR repository name for auto-build', default: 'autoir'}),
     tag: Flags.string({description: 'Image tag for auto-build', default: 'latest'}),
-    dsn: Flags.string({description: 'TiDB DSN (overrides saved profile)'}),
-    ensureTables: Flags.boolean({description: 'Ensure DB tables before deploy', default: true}),
+    'opensearch-endpoint': Flags.string({description: 'OpenSearch endpoint', env: 'OPENSEARCH_ENDPOINT'}),
+    'opensearch-region': Flags.string({description: 'OpenSearch region', env: 'OPENSEARCH_REGION'}),
+    ensureTables: Flags.boolean({description: 'No-op in AWS-only stack (OpenSearch index used)', default: false}),
     // Kebab-case aliases for UX
     logGroup: Flags.string({description: 'CloudWatch Logs log group for the daemon', default: '/autoir/daemon'}),
     'log-group': Flags.string({description: 'CloudWatch Logs log group for the daemon (alias)'}),

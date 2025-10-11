@@ -7,7 +7,7 @@ import * as fs from 'node:fs/promises'
 import {getLlmConfig, setLlmConfig} from '../../lib/config.js'
 
 export default class LlmConfig extends Command {
-  static description = 'Configure LLM provider (AWS Kimi K2 or OpenAI) and credentials'
+  static description = 'Configure LLM provider (Amazon Bedrock or OpenAI) and credentials'
 
   static examples = [
     '<%= config.bin %> <%= command.id %>',
@@ -15,20 +15,20 @@ export default class LlmConfig extends Command {
   ]
 
   static flags = {
-    provider: Flags.string({options: ['aws', 'openai'] as const, description: 'LLM provider to use'}),
+    provider: Flags.string({options: ['bedrock', 'openai'] as const, description: 'LLM provider to use'}),
     'openai-key': Flags.string({description: 'OpenAI API key'}),
     'openai-model': Flags.string({description: 'OpenAI model', default: 'gpt-4o-mini'}),
-    endpoint: Flags.string({description: 'Default AWS/Kimi K2 endpoint name to use'}),
+    endpoint: Flags.string({description: 'Amazon Bedrock model ID to use (e.g., us.amazon.nova-micro-v1:0)'}),
   }
 
-  private endpointsPath = path.join(os.homedir(), '.autoir', 'kimi-k2-endpoints.json')
+  private endpointsPath = path.join(os.homedir(), '.autoir', 'bedrock-models.json')
 
   async run(): Promise<void> {
     const {flags} = await this.parse(LlmConfig)
 
     const current = await getLlmConfig()
 
-    let provider = flags.provider as 'aws' | 'openai' | undefined
+    let provider = flags.provider as 'bedrock' | 'openai' | undefined
     let openaiKey = flags['openai-key']
     let openaiModel = flags['openai-model']
     let endpoint = flags.endpoint
@@ -38,9 +38,9 @@ export default class LlmConfig extends Command {
         type: 'list',
         name: 'provider',
         message: 'Choose LLM provider',
-        default: current?.provider || 'aws',
+        default: current?.provider || 'bedrock',
         choices: [
-          {name: 'AWS self-hosted (Kimi K2)', value: 'aws'},
+          {name: 'Amazon Bedrock', value: 'bedrock'},
           {name: 'OpenAI', value: 'openai'}
         ]
       }])
@@ -70,7 +70,7 @@ export default class LlmConfig extends Command {
       await setLlmConfig({provider: 'openai', openaiApiKey: openaiKey!, openaiModel})
       this.log(chalk.green('LLM provider set to OpenAI.'))
     } else {
-      // AWS path: optionally pick default endpoint
+      // Bedrock path: optionally pick default model
       if (!endpoint) {
         const endpoints = await this.loadAwsEndpoints()
         const names = Object.keys(endpoints)
@@ -78,19 +78,19 @@ export default class LlmConfig extends Command {
           const answer = await inquirer.prompt([{
             type: 'list',
             name: 'endpoint',
-            message: 'Select default AWS/Kimi K2 endpoint (optional)',
+            message: 'Select default Bedrock model (optional)',
             choices: [...names, new inquirer.Separator(), 'Skip'],
             default: current?.currentEndpoint && names.includes(current.currentEndpoint) ? current.currentEndpoint : undefined
           }])
           endpoint = answer.endpoint === 'Skip' ? undefined : answer.endpoint
         }
       }
-      await setLlmConfig({provider: 'aws', currentEndpoint: endpoint})
-      this.log(chalk.green(`LLM provider set to AWS${endpoint ? ` (default endpoint: ${endpoint})` : ''}.`))
+      await setLlmConfig({provider: 'bedrock', currentEndpoint: endpoint})
+      this.log(chalk.green(`LLM provider set to Amazon Bedrock${endpoint ? ` (default model: ${endpoint})` : ''}.`))
     }
   }
 
-  private async loadAwsEndpoints(): Promise<Record<string, {endpoint: string}>> {
+  private async loadAwsEndpoints(): Promise<Record<string, {model: string}>> {
     try {
       const raw = await fs.readFile(this.endpointsPath, 'utf8')
       return JSON.parse(raw)

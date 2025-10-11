@@ -1,8 +1,8 @@
 import {Command, Flags} from '@oclif/core'
 import {spawn} from 'node:child_process'
-import mysql from 'mysql2/promise'
-import {parseMySqlDsn, setLlmConfig} from '../lib/config.js'
-import {ensureAutoIrTables, getCursor, setCursor, upsertIncidentByDedupe} from '../lib/db.js'
+import {setLlmConfig} from '../lib/config.js'
+import {DynamoStore} from '../lib/aws/dynamo.js'
+import {OpenSearchClient} from '../lib/aws/opensearch.js'
 import {ToolManager} from '../lib/tools/index.js'
 import {LlmClient, LlmMessage} from '../lib/llm/client.js'
 import crypto from 'node:crypto'
@@ -31,7 +31,11 @@ export default class Daemon extends Command {
     snsTopicArn: Flags.string({description: 'SNS Topic ARN for alerts'}),
     alertsMaxEvents: Flags.integer({description: 'Max events to scan per tick', default: 1000}),
     alertsMaxSamplesPerIssue: Flags.integer({description: 'Max sample messages per detected issue', default: 5}),
-    table: Flags.string({description: 'TiDB table with logs', default: 'autoir_log_events'}),
+    index: Flags.string({description: 'OpenSearch index with logs', default: 'autoir_log_events'}),
+    'opensearch-endpoint': Flags.string({description: 'OpenSearch endpoint', env: 'OPENSEARCH_ENDPOINT'}),
+    'opensearch-region': Flags.string({description: 'OpenSearch region', env: 'OPENSEARCH_REGION'}),
+    'dynamo-region': Flags.string({description: 'DynamoDB region', env: 'DYNAMO_REGION'}),
+    'dynamo-prefix': Flags.string({description: 'DynamoDB table prefix', default: 'autoir'}),
   }
 
   async run(): Promise<void> {
@@ -88,33 +92,15 @@ export default class Daemon extends Command {
   }
 
   private async startAlertingLoop(flags: any): Promise<void> {
-    // Resolve TiDB DSN
-    const dsn = process.env.TIDB_DSN
-    if (!dsn) {
-      this.log('[alerts] TIDB_DSN not set. Alerting will be skipped.')
+    const osEndpoint = flags['opensearch-endpoint'] || process.env.OPENSEARCH_ENDPOINT
+    const osRegion = flags['opensearch-region'] || process.env.OPENSEARCH_REGION || flags.region
+    const dynRegion = flags['dynamo-region'] || process.env.DYNAMO_REGION || flags.region || process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION
+    if (!osEndpoint || !osRegion || !dynRegion) {
+      this.log('[alerts] Missing OpenSearch or Dynamo configuration. Skipping alerting.')
       return
     }
-    const conn = parseMySqlDsn(dsn)
-    if (!conn) {
-      this.log('[alerts] Failed to parse TIDB_DSN. Skipping alerting.')
-      return
-    }
-
-    const pool = mysql.createPool({
-      host: conn.host,
-      port: conn.port ?? 4000,
-      user: conn.user,
-      password: conn.password,
-      database: conn.database,
-      waitForConnections: true,
-      connectionLimit: 4,
-      ...( /tidbcloud\.com$/i.test(conn.host) ? {ssl: {minVersion: 'TLSv1.2', rejectUnauthorized: true}} : {}),
-    })
-
-    try {
-      // Ensure tables exist
-      await ensureAutoIrTables(pool, flags.table)
-    } catch {}
+    const os = new OpenSearchClient({endpoint: osEndpoint, region: osRegion})
+    const dyn = new DynamoStore(dynRegion, {prefix: flags['dynamo-prefix']})
 
     // Prepare LLM (headless). Prefer OpenAI if OPENAI_API_KEY set; otherwise try AWS endpoint if configured previously.
     try {
@@ -144,20 +130,13 @@ export default class Daemon extends Command {
 
     const tick = async () => {
       const now = Date.now()
-      const sinceCursor = await getCursor(pool, 'alerts')
+      const sinceCursor = await dyn.getCursor('alerts')
       const windowStart = Math.max(now - windowMin * 60_000, sinceCursor || now - windowMin * 60_000)
       try {
-        const [rows] = await pool.query<mysql.RowDataPacket[]>(
-          `SELECT id, log_group, log_stream, ts_ms, message
-           FROM \`${table}\`
-           WHERE ts_ms > ? AND ts_ms <= ? AND CHAR_LENGTH(message) >= 10
-           ORDER BY ts_ms ASC
-           LIMIT ?`,
-          [windowStart, now, maxEvents],
-        )
+        const rows = await os.queryRange(flags.index || 'autoir_log_events', windowStart, now, maxEvents, 10)
         const events = rows as Array<{id: string; log_group: string; log_stream: string; ts_ms: number; message: string}>
         if (!events.length) {
-          await setCursor(pool, 'alerts', now)
+          await dyn.setCursor('alerts', now)
           return
         }
 
@@ -209,7 +188,7 @@ export default class Daemon extends Command {
           if (severities.indexOf(severity) < minSeverityIdx || confidence < minConfidence) continue
 
           const dedupeKey = String(inc?.dedupe_key || `${inc?.title || 'incident'}|${hashString(JSON.stringify(aggregates).slice(0,300))}|${new Date(now).toISOString().slice(0,13)}`)
-          const {created, id} = await upsertIncidentByDedupe(pool, {
+          const {created, id} = await dyn.upsertIncidentByDedupe({
             dedupe_key: dedupeKey,
             severity,
             title: truncate(String(inc?.title || 'Detected issue'), 255),
@@ -237,7 +216,7 @@ export default class Daemon extends Command {
           }
         }
 
-        await setCursor(pool, 'alerts', events[events.length-1].ts_ms)
+        await dyn.setCursor('alerts', events[events.length-1].ts_ms)
       } catch (e) {
         this.log(`[alerts] tick error: ${e instanceof Error ? e.message : String(e)}`)
       }

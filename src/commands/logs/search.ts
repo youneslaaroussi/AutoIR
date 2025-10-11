@@ -1,9 +1,9 @@
 import {Command, Flags} from '@oclif/core'
-import mysql from 'mysql2/promise'
+import {OpenSearchClient} from '../../lib/aws/opensearch.js'
 import {SageMakerRuntimeClient, InvokeEndpointCommand} from '@aws-sdk/client-sagemaker-runtime'
 import {CloudWatchLogsClient, DescribeLogGroupsCommand} from '@aws-sdk/client-cloudwatch-logs'
 import {spawn} from 'node:child_process'
-import {getTiDBProfile, parseMySqlDsn} from '../../lib/config.js'
+// TiDB config no longer needed in AWS-only stack
 import blessed from 'blessed'
 import contrib from 'blessed-contrib'
 import inquirer from 'inquirer'
@@ -33,30 +33,18 @@ export default class LogsSearch extends Command {
     'sagemaker-endpoint': Flags.string({description: 'SageMaker endpoint for embeddings', required: true}),
     'sagemaker-region': Flags.string({description: 'AWS region for SageMaker endpoint'}),
     region: Flags.string({char: 'r', description: 'AWS region (fallback for SageMaker)'}),
-    table: Flags.string({description: 'TiDB table with logs', default: 'autoir_log_events'}),
-    'tidb-host': Flags.string({description: 'TiDB host (or endpoint)'}),
-    'tidb-port': Flags.integer({description: 'TiDB port', default: 4000}),
-    'tidb-user': Flags.string({description: 'TiDB user'}),
-    'tidb-password': Flags.string({description: 'TiDB password'}),
-    'tidb-database': Flags.string({description: 'TiDB database'}),
-    dsn: Flags.string({description: 'MySQL DSN: mysql://user:pass@host:port/db', env: 'TIDB_DSN'}),
+    index: Flags.string({description: 'OpenSearch index', default: 'autoir_log_events'}),
+    'opensearch-endpoint': Flags.string({description: 'OpenSearch endpoint', env: 'OPENSEARCH_ENDPOINT'}),
+    'opensearch-region': Flags.string({description: 'OpenSearch region', env: 'OPENSEARCH_REGION'}),
   }
 
   async run(): Promise<void> {
     const {flags} = await this.parse(LogsSearch)
 
-    // Connect to TiDB
-    const conn = await this.resolveTiDBConn(flags)
-    const pool = mysql.createPool({
-      host: conn.host,
-      port: conn.port ?? 4000,
-      user: conn.user,
-      password: conn.password,
-      database: conn.database,
-      waitForConnections: true,
-      connectionLimit: 5,
-      ...( /tidbcloud\.com$/i.test(conn.host) ? {ssl: {minVersion: 'TLSv1.2', rejectUnauthorized: true}} : {}),
-    })
+    const osEndpoint = flags['opensearch-endpoint'] || process.env.OPENSEARCH_ENDPOINT
+    const osRegion = flags['opensearch-region'] || process.env.OPENSEARCH_REGION || flags.region
+    if (!osEndpoint || !osRegion) this.error('OpenSearch endpoint/region required')
+    const os = new OpenSearchClient({endpoint: osEndpoint, region: osRegion})
 
     // Create blessed screen
     const screen = blessed.screen({
@@ -302,7 +290,7 @@ export default class LogsSearch extends Command {
         }
 
         // Search
-        const results = await this.searchByVector(pool, flags.table!, qVec, undefined, undefined, 20, 10)
+        const results = await os.searchByVector(flags.index!, qVec, 20, {minLen: 10})
         lastResultsCache = results
         
         statusBox.setContent(`Found ${results.length} results`)
@@ -616,7 +604,7 @@ ${result.message}`
     })
 
     screen.key(['q', 'C-c'], () => {
-      pool.end()
+      // nothing to close
       process.exit(0)
     })
 

@@ -1,6 +1,5 @@
 import blessed from 'blessed'
 import contrib from 'blessed-contrib'
-import mysql from 'mysql2/promise'
 import {Screen, ScreenContext} from '../lib/screen-manager.js'
 
 export class LogsScreen implements Screen {
@@ -49,8 +48,8 @@ export class LogsScreen implements Screen {
       parent: header,
       top: 1,
       left: 2,
-      content: `Database: ${context.dbPool ? 'Connected' : 'Not connected'} • Auto-refresh: ON`,
-      style: { fg: context.dbPool ? 'green' : 'red' }
+      content: `OpenSearch: ${context.os ? 'Ready' : 'Not configured'} • Auto-refresh: ON`,
+      style: { fg: context.os ? 'green' : 'red' }
     })
 
     // Filter input
@@ -108,30 +107,17 @@ export class LogsScreen implements Screen {
 
     // Load recent logs function
     const loadRecentLogs = async (filter?: string) => {
-      if (!context.dbPool) {
+      if (!context.os || !context.osIndex) {
         this.logsTable!.setData({
           headers: ['Timestamp', 'Group', 'Stream', 'Message'],
-          data: [['Error', '', '', 'Database not connected']]
+          data: [['Error', '', '', 'OpenSearch not configured']]
         })
         screen.render()
         return
       }
 
       try {
-        const table = context.flags.table || 'autoir_log_events'
-        let sql = `SELECT log_group, log_stream, ts_ms, message FROM \`${table}\``
-        const params: any[] = []
-
-        if (filter && filter.trim()) {
-          sql += ` WHERE log_group LIKE ? OR log_stream LIKE ? OR message LIKE ?`
-          const filterParam = `%${filter.trim()}%`
-          params.push(filterParam, filterParam, filterParam)
-        }
-
-        sql += ` ORDER BY ts_ms DESC LIMIT 50`
-
-        const [rows] = await context.dbPool.query(sql, params)
-        const logs = rows as any[]
+        const logs = await context.os.fetchRecent(context.osIndex, 50, undefined)
 
         const tableData = logs.map(log => [
           new Date(log.ts_ms).toLocaleString(),
@@ -145,7 +131,7 @@ export class LogsScreen implements Screen {
           data: tableData.length > 0 ? tableData : [['No logs', '', '', 'No logs found matching criteria']]
         })
 
-        this.statusText!.setContent(`Database: Connected • Loaded ${logs.length} logs • Last refresh: ${new Date().toLocaleTimeString()}`)
+        this.statusText!.setContent(`OpenSearch: Ready • Loaded ${logs.length} logs • Last refresh: ${new Date().toLocaleTimeString()}`)
         screen.render()
       } catch (error: any) {
         this.logsTable!.setData({

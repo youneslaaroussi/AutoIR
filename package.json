@@ -1,6 +1,6 @@
 {
   "name": "autoir",
-  "description": "Incident Reporting for AWS using AI Agents powered by TiDB and Kimi K2.",
+  "description": "Incident Reporting for AWS using AI Agents powered by Amazon Bedrock, OpenSearch, and DynamoDB.",
   "version": "1.0.0",
   "author": "Younes Laaroussi",
   "bin": {
@@ -12,6 +12,11 @@
     "@aws-sdk/client-cloudwatch-logs": "^3.864.0",
     "@aws-sdk/client-sns": "^3.864.0",
     "@aws-sdk/client-sagemaker-runtime": "^3.864.0",
+    "@aws-sdk/client-dynamodb": "^3.864.0",
+    "@aws-sdk/lib-dynamodb": "^3.864.0",
+    "@aws-sdk/credential-provider-node": "^3.864.0",
+    "@aws-sdk/protocol-http": "^3.864.0",
+    "@aws-crypto/sha256-js": "^5.2.0",
     "@oclif/core": "^4",
     "@oclif/plugin-help": "^6",
     "@oclif/plugin-plugins": "^5",
